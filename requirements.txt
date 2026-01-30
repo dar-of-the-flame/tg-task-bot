@@ -1,5 +1,5 @@
-aiogram==2.25.1
-aiohttp==3.10.0  # Версия с wheel для Python 3.13, не требует компиляции
+aiogram==3.13.0
+aiohttp==3.9.1
 apscheduler==3.10.4
-psycopg2-binary==2.9.10  # Готовый бинарный пакет вместо asyncpg
+psycopg2-binary==2.9.10
 python-dotenv==1.0.0
