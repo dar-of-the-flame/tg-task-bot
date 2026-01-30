@@ -1,13 +1,12 @@
-import os
-import asyncio
-import logging
+import os, asyncio, logging
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 
 load_dotenv()
 
-from aiogram import Bot, Dispatcher, types, Router
+from aiogram import Bot, Dispatcher, types
 from aiogram.enums import ParseMode
+from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
 from aiohttp import web
@@ -16,98 +15,86 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ========== КОНФИГУРАЦИЯ ==========
 API_TOKEN = os.getenv('BOT_TOKEN')
-if not API_TOKEN:
-    raise ValueError("Не задан BOT_TOKEN")
-
-WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"  # ЗАМЕНИ НА СВОЙ URL
+WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"  # ЗАМЕНИ!
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=API_TOKEN, parse_mode=ParseMode.MARKDOWN)
+# ========== ИСПРАВЛЕНИЕ: новый способ создания бота ==========
+bot = Bot(
+    token=API_TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)  # <-- ВОТ ЭТО
+)
+
 dp = Dispatcher()
-router = Router()
-dp.include_router(router)
 scheduler = AsyncIOScheduler()
 app = web.Application()
 
 # ========== TELEGRAM КОМАНДЫ ==========
-@router.message(Command(commands=["start", "help"]))
+@dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="📋 Открыть TaskFlow", web_app=WebAppInfo(url=WEB_APP_URL))]
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=False
+        keyboard=[[KeyboardButton(text="📋 Открыть", web_app=WebAppInfo(url=WEB_APP_URL))]],
+        resize_keyboard=True
     )
-    await message.answer(
-        "🚀 Привет! Я твой планировщик задач.\n"
-        "Нажми кнопку ниже, чтобы открыть интерфейс и добавить первую задачу с напоминанием!",
-        reply_markup=keyboard
-    )
+    await message.answer("Нажми кнопку ниже:", reply_markup=keyboard)
 
-@router.message(Command(commands=["test"]))
+@dp.message(Command("test"))
 async def cmd_test(message: types.Message):
-    await message.answer("✅ Бот работает! Тестовое сообщение.")
+    await message.answer("✅ Бот работает!")
 
-@router.message(Command(commands=["ping_db"]))
-async def cmd_ping_db(message: types.Message):
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message):
+    """Проверка статуса бота"""
     try:
-        database.init_db()
-        await message.answer("✅ Подключение к БД в порядке!")
+        await asyncio.to_thread(database.init_db)
+        await message.answer("✅ Бот и БД работают!")
     except Exception as e:
-        await message.answer(f"❌ Ошибка БД: {str(e)[:200]}")
+        await message.answer(f"❌ Ошибка: {str(e)[:100]}")
 
-# ========== API ДЛЯ FRONTEND ==========
-async def handle_api_new_task(request):
+# ========== API ==========
+async def api_new_task(request):
+    """API для приёма задач от фронтенда"""
     try:
         data = await request.json()
         logger.info(f"📥 Получена задача: {data}")
         
-        required = ['user_id', 'task_text', 'remind_in_minutes']
-        if not all(key in data for key in required):
+        # Базовые проверки
+        if 'user_id' not in data or 'task_text' not in data:
             return web.json_response(
-                {"status": "error", "message": "Не хватает полей"},
+                {"status": "error", "message": "Не хватает user_id или task_text"},
                 status=400
             )
         
         user_id = int(data['user_id'])
         emoji = data.get('emoji', '📌')
         task_text = data['task_text']
-        remind_in = int(data['remind_in_minutes'])
+        remind_in = int(data.get('remind_in_minutes', 0))
         
         # Рассчитываем время напоминания
-        if data.get('start_time'):
-            start_time = datetime.fromisoformat(data['start_time'].replace('Z', '+00:00'))
-            remind_at = start_time - timedelta(minutes=remind_in)
-        else:
-            start_time = None
-            remind_at = datetime.now() + timedelta(minutes=remind_in)
+        remind_at = datetime.now() + timedelta(minutes=remind_in)
         
-        end_time = None
-        if data.get('end_time'):
-            end_time = datetime.fromisoformat(data['end_time'].replace('Z', '+00:00'))
-        
+        # Сохраняем в БД
         task_id = await asyncio.to_thread(
-            database.add_task,
-            user_id, emoji, task_text, remind_at, start_time, end_time
+            database.add_task, 
+            user_id, emoji, task_text, remind_at,
+            data.get('start_time'), data.get('end_time')
         )
         
         if task_id:
             return web.json_response({
-                "status": "ok",
+                "status": "ok", 
                 "task_id": task_id,
-                "remind_at": remind_at.isoformat()
+                "message": f"Задача добавлена! Напоминание в {remind_at.strftime('%H:%M')}"
             })
         else:
             return web.json_response(
-                {"status": "error", "message": "Ошибка при сохранении в БД"},
+                {"status": "error", "message": "Ошибка сохранения в БД"},
                 status=500
             )
             
     except Exception as e:
-        logger.error(f"❌ Ошибка API: {e}")
+        logger.error(f"❌ API error: {e}")
         return web.json_response(
             {"status": "error", "message": str(e)[:100]},
             status=500
@@ -115,6 +102,7 @@ async def handle_api_new_task(request):
 
 # ========== ФУНКЦИЯ РАССЫЛКИ НАПОМИНАНИЙ ==========
 async def check_and_send_reminders():
+    """Проверяет и отправляет напоминания каждую минуту"""
     try:
         tasks = await asyncio.to_thread(database.get_pending_reminders)
         
@@ -125,15 +113,7 @@ async def check_and_send_reminders():
         
         for task in tasks:
             try:
-                time_info = ""
-                if task['start_time']:
-                    if isinstance(task['start_time'], str):
-                        start = datetime.fromisoformat(task['start_time'])
-                    else:
-                        start = task['start_time']
-                    time_info = f" в {start.strftime('%H:%M')}"
-                
-                message = f"🔔 {task['emoji'] or '📌'} **Напоминание!**\n\n{task['task_text']}{time_info}"
+                message = f"🔔 {task['emoji']} {task['task_text']}"
                 
                 await bot.send_message(
                     chat_id=task['user_id'],
@@ -141,22 +121,23 @@ async def check_and_send_reminders():
                 )
                 
                 await asyncio.to_thread(database.mark_reminder_sent, task['id'])
-                logger.info(f"   ✓ Отправлено user_id={task['user_id']}")
+                logger.info(f"   ✅ Отправлено user_id={task['user_id']}")
                 
             except Exception as e:
-                logger.error(f"   ✗ Ошибка отправки user_id={task['user_id']}: {e}")
+                logger.error(f"   ❌ Ошибка отправки user_id={task['user_id']}: {e}")
                 
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в check_and_send_reminders: {e}")
 
 # ========== ЗАПУСК И НАСТРОЙКА ==========
 async def on_startup():
+    """Действия при запуске бота"""
     logger.info("=== Бот запускается ===")
     
     # Инициализируем БД
     await asyncio.to_thread(database.init_db)
     
-    # Запускаем планировщик
+    # Запускаем планировщик (проверка каждую минуту)
     scheduler.add_job(
         check_and_send_reminders,
         'interval',
@@ -168,9 +149,9 @@ async def on_startup():
     logger.info("✅ Планировщик APScheduler запущен")
     
     # Настраиваем API маршруты
-    app.router.add_post('/api/new_task', handle_api_new_task)
+    app.router.add_post('/api/new_task', api_new_task)
     
-    # Эндпоинты для проверки здоровья
+    # Эндпоинты для проверки здоровья (для UptimeRobot)
     async def health_check(request):
         return web.Response(text="Bot is running")
     
@@ -181,25 +162,29 @@ async def on_startup():
     admin_id = os.getenv('ADMIN_ID')
     if admin_id:
         try:
-            await bot.send_message(admin_id, "🤖 Бот планировщика успешно запущен на aiogram 3.x!")
-        except Exception as e:
-            logger.error(f"Не удалось отправить сообщение админу: {e}")
+            await bot.send_message(admin_id, "🤖 Бот планировщика успешно запущен!")
+        except:
+            pass
     
     logger.info("=== Бот успешно запущен ===")
 
 async def main():
-    """Основная функция запуска."""
+    """Основная функция запуска"""
     await on_startup()
     
-    # Запускаем aiohttp сервер в фоне
+    # Запускаем aiohttp сервер
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', int(os.getenv('PORT', 10000)))
+    
+    # Render сам назначает порт через переменную PORT
+    port = int(os.getenv('PORT', 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     
-    logger.info(f"🌐 Веб-сервер запущен на порту {os.getenv('PORT', 10000)}")
+    logger.info(f"🌐 Веб-сервер запущен на порту {port}")
+    logger.info(f"🔗 API доступно по: /api/new_task")
     
-    # Запускаем бота
+    # Запускаем бота (он будет работать вечно)
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
@@ -208,4 +193,5 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.info("Бот остановлен")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+        logger.error(f"💥 Критическая ошибка: {e}")
+        raise
