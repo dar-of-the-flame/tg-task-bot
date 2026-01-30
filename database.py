@@ -1,93 +1,93 @@
-import psycopg2
-import psycopg2.extras
 import os
 import logging
-from datetime import datetime, timedelta
-from contextlib import contextmanager
+from datetime import datetime
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-@contextmanager
-def get_db_connection():
-    """Контекстный менеджер для подключения к БД."""
-    conn = None
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        yield conn
-    except Exception as e:
-        logger.error(f"Ошибка подключения к БД: {e}")
-        raise
-    finally:
-        if conn:
-            conn.close()
+def get_connection():
+    """Создаёт синхронное подключение к БД."""
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
-    """Создаёт таблицу, если её нет."""
+    """Создаёт таблицу tasks при первом запуске."""
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute('''
-                    CREATE TABLE IF NOT EXISTS tasks (
-                        id SERIAL PRIMARY KEY,
-                        user_id BIGINT NOT NULL,
-                        emoji TEXT,
-                        task_text TEXT NOT NULL,
-                        start_time TIMESTAMP,
-                        end_time TIMESTAMP,
-                        remind_at TIMESTAMP NOT NULL,
-                        reminder_sent BOOLEAN DEFAULT FALSE,
-                        created_at TIMESTAMP DEFAULT NOW()
-                    )
-                ''')
-                conn.commit()
-        logger.info("Таблица 'tasks' создана или уже существует.")
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS tasks (
+                id SERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                emoji TEXT,
+                task_text TEXT NOT NULL,
+                start_time TIMESTAMP,
+                end_time TIMESTAMP,
+                remind_at TIMESTAMP NOT NULL,
+                reminder_sent BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        ''')
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info("✅ Таблица 'tasks' готова")
         return True
     except Exception as e:
-        logger.error(f"Ошибка при инициализации БД: {e}")
+        logger.error(f"❌ Ошибка инициализации БД: {e}")
         return False
 
 def add_task(user_id, emoji, task_text, remind_at, start_time=None, end_time=None):
-    """Добавляет новую задачу в базу."""
+    """Добавляет задачу в БД. Возвращает ID созданной задачи или None."""
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute('''
-                    INSERT INTO tasks (user_id, emoji, task_text, remind_at, start_time, end_time)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                ''', (user_id, emoji, task_text, remind_at, start_time, end_time))
-                conn.commit()
-        logger.info(f"Задача добавлена для user_id={user_id}")
-        return True
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            INSERT INTO tasks (user_id, emoji, task_text, remind_at, start_time, end_time)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+        ''', (user_id, emoji, task_text, remind_at, start_time, end_time))
+        task_id = cur.fetchone()['id']
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"✅ Задача {task_id} добавлена для user_id={user_id}")
+        return task_id
     except Exception as e:
-        logger.error(f"Ошибка при добавлении задачи: {e}")
-        return False
+        logger.error(f"❌ Ошибка добавления задачи: {e}")
+        return None
 
 def get_pending_reminders():
     """Возвращает список задач, для которых пора отправить напоминание."""
     try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-                cur.execute('''
-                    SELECT id, user_id, emoji, task_text, start_time
-                    FROM tasks 
-                    WHERE reminder_sent = FALSE 
-                    AND remind_at <= NOW() + INTERVAL '1 minute'
-                    AND remind_at > NOW() - INTERVAL '5 minutes'
-                ''')
-                return cur.fetchall()
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT id, user_id, emoji, task_text, start_time
+            FROM tasks 
+            WHERE reminder_sent = FALSE 
+            AND remind_at <= NOW() + INTERVAL '1 minute'
+            AND remind_at > NOW() - INTERVAL '5 minutes'
+        ''')
+        tasks = cur.fetchall()
+        cur.close()
+        conn.close()
+        return tasks
     except Exception as e:
-        logger.error(f"Ошибка при получении напоминаний: {e}")
+        logger.error(f"❌ Ошибка получения напоминаний: {e}")
         return []
 
 def mark_reminder_sent(task_id):
     """Помечает напоминание как отправленное."""
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute('UPDATE tasks SET reminder_sent = TRUE WHERE id = %s', (task_id,))
-                conn.commit()
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute('UPDATE tasks SET reminder_sent = TRUE WHERE id = %s', (task_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
     except Exception as e:
-        logger.error(f"Ошибка при обновлении задачи {task_id}: {e}")
+        logger.error(f"❌ Ошибка обновления задачи {task_id}: {e}")
