@@ -1,5 +1,5 @@
 aiogram==2.25.1
-aiohttp==3.9.1
+aiohttp==3.8.0  # Понижаем до версии, совместимой с aiogram
 apscheduler==3.10.4
 asyncpg==0.29.0
 python-dotenv==1.0.0
