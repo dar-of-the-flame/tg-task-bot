@@ -77,11 +77,12 @@ async def api_new_task(request):
         time = data.get('time', '')
         reminder = int(data.get('reminder', 0))
         emoji = data.get('emoji', '📝')
+        is_reminder = data.get('is_reminder', False)
         
         # Сохраняем в БД
         task_id = await asyncio.to_thread(
             database.add_task, 
-            user_id, text, date, time, reminder, category, priority, emoji
+            user_id, text, date, time, reminder, category, priority, emoji, is_reminder
         )
         
         if task_id:
@@ -118,7 +119,7 @@ async def api_get_tasks(request):
             
             # Конвертируем datetime в строки
             for task in tasks:
-                for key in ['date', 'time', 'created_at', 'completed_at', 'deleted_at']:
+                for key in ['date', 'time', 'created_at', 'completed_at', 'deleted_at', 'remind_at']:
                     if task[key] and hasattr(task[key], 'isoformat'):
                         task[key] = task[key].isoformat()
             
@@ -158,10 +159,11 @@ async def api_update_task(request):
         
         completed = data.get('completed')
         deleted = data.get('deleted', False)
+        archived = data.get('archived')
         
         success = await asyncio.to_thread(
             database.update_task, 
-            task_id, int(user_id), completed, deleted
+            task_id, int(user_id), completed, deleted, archived
         )
         
         if success:
@@ -188,13 +190,11 @@ async def check_and_send_reminders():
         if not tasks:
             return
             
-        logger.info(f"🔔 Найдено задач для напоминания: {len(tasks)}")
+        logger.info(f"🔔 Найдено напоминаний для отправки: {len(tasks)}")
         
         for task in tasks:
             try:
-                message = f"🔔 Напоминание: {task['text']}"
-                if task['time']:
-                    message += f"\n🕒 Время: {task['time'].strftime('%H:%M')}"
+                message = f"🔔 **Напоминание!**\n\n{task['text']}"
                 
                 await bot.send_message(
                     chat_id=task['user_id'],
@@ -202,13 +202,23 @@ async def check_and_send_reminders():
                 )
                 
                 await asyncio.to_thread(database.mark_reminder_sent, task['id'])
-                logger.info(f"   ✅ Отправлено user_id={task['user_id']}")
+                logger.info(f"   ✅ Напоминание отправлено user_id={task['user_id']}")
                 
             except Exception as e:
-                logger.error(f"   ❌ Ошибка отправки user_id={task['user_id']}: {e}")
+                logger.error(f"   ❌ Ошибка отправки напоминания user_id={task['user_id']}: {e}")
                 
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в check_and_send_reminders: {e}")
+
+# ========== ФУНКЦИЯ АРХИВАЦИИ ПРОСРОЧЕННЫХ ЗАДАЧ ==========
+async def archive_overdue_tasks_job():
+    """Автоматическая архивация просроченных задач"""
+    try:
+        archived_count = await asyncio.to_thread(database.archive_overdue_tasks)
+        if archived_count > 0:
+            logger.info(f"📦 Автоматически архивировано {archived_count} просроченных задач")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при архивации просроченных задач: {e}")
 
 # ========== ЗАПУСК И НАСТРОЙКА ==========
 async def on_startup():
@@ -226,6 +236,16 @@ async def on_startup():
         id="reminder_check",
         replace_existing=True
     )
+    
+    # Запускаем задачу архивации просроченных задач (раз в день)
+    scheduler.add_job(
+        archive_overdue_tasks_job,
+        'interval',
+        days=1,
+        id="archive_check",
+        replace_existing=True
+    )
+    
     scheduler.start()
     logger.info("✅ Планировщик APScheduler запущен")
     
