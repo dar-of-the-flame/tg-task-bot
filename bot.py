@@ -1,19 +1,18 @@
 import os
 import asyncio
 import logging
-from datetime import datetime, timedelta
 from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, ParseMode
+from aiogram.types import Message, CallbackQuery, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
-from aiogram.types import WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
 import database
@@ -311,7 +310,7 @@ async def on_startup():
                 "✅ Планировщик запущен\n"
                 "✅ API готово к работе\n"
                 f"✅ Webhook: {'установлен' if WEBHOOK_HOST else 'не используется'}\n\n"
-                "🚀 Бот готов к работу!",
+                "🚀 Бот готов к работе!",
                 parse_mode=ParseMode.MARKDOWN
             )
         except Exception as e:
