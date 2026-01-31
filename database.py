@@ -228,19 +228,20 @@ def get_pending_reminders():
         return []
 
 def mark_reminder_sent(task_id):
-    """Отмечает напоминание как отправленное"""
+    """Отмечает напоминание как отправленное и архивирует его"""
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute('''
             UPDATE tasks 
-            SET reminder_sent = TRUE 
+            SET reminder_sent = TRUE,
+                archived = TRUE
             WHERE id = %s
         ''', (task_id,))
         conn.commit()
         cur.close()
         conn.close()
-        logger.info(f"✅ Напоминание {task_id} помечено как отправленное")
+        logger.info(f"✅ Напоминание {task_id} помечено как отправленное и заархивировано")
     except Exception as e:
         logger.error(f"❌ Ошибка обновления задачи {task_id}: {e}")
 
