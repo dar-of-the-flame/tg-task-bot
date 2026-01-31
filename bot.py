@@ -19,6 +19,10 @@ WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ========== ИСПРАВЛЕНИЕ: УНИКАЛЬНЫЙ ID ДЛЯ WEBHOOK ==========
+WEBHOOK_PATH = f"/webhook/{API_TOKEN.replace(':', '_')}"
+WEBHOOK_URL = f"https://tg-task-bot-service.onrender.com{WEBHOOK_PATH}"
+
 bot = Bot(
     token=API_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
@@ -95,7 +99,6 @@ async def api_new_task(request):
         reminder = data.get('reminder', 0)
         remind_at = datetime.now() + timedelta(minutes=reminder) if reminder > 0 else datetime.now()
         
-        # Определяем дату и время из полей date и time
         start_time = None
         if data.get('date'):
             date_str = data['date']
@@ -108,7 +111,7 @@ async def api_new_task(request):
         task_id = await asyncio.to_thread(
             database.add_task, 
             user_id, emoji, task_text, remind_at,
-            start_time, None  # start_time, end_time
+            start_time, None, category, data.get('priority', 'medium')
         )
         
         if task_id:
@@ -153,6 +156,32 @@ async def api_get_tasks(request):
             status=500
         )
 
+# ========== WEBHOOK HANDLERS ==========
+async def set_webhook():
+    """Установка webhook для избежания конфликтов polling"""
+    try:
+        webhook_info = await bot.get_webhook_info()
+        if webhook_info.url != WEBHOOK_URL:
+            await bot.set_webhook(
+                url=WEBHOOK_URL,
+                drop_pending_updates=True
+            )
+            logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
+        else:
+            logger.info(f"✅ Webhook уже установлен: {WEBHOOK_URL}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка установки webhook: {e}")
+
+async def handle_webhook(request):
+    """Обработчик webhook от Telegram"""
+    try:
+        update = types.Update(**(await request.json()))
+        await dp.feed_update(bot=bot, update=update)
+        return web.Response()
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки webhook: {e}")
+        return web.Response(status=400)
+
 # ========== ЗДОРОВЬЕ И ГЛАВНАЯ ==========
 async def health_check(request):
     return web.Response(text="Bot is running")
@@ -192,8 +221,10 @@ async def check_and_send_reminders():
 async def on_startup():
     logger.info("=== Бот запускается ===")
     
+    # 1. Инициализация БД
     await asyncio.to_thread(database.init_db)
     
+    # 2. Настройка планировщика напоминаний
     scheduler.add_job(
         check_and_send_reminders,
         'interval',
@@ -204,25 +235,31 @@ async def on_startup():
     scheduler.start()
     logger.info("✅ Планировщик APScheduler запущен")
     
-    # API маршруты
+    # 3. Установка webhook (вместо polling)
+    await set_webhook()
+    
+    # 4. Настройка маршрутов API
     app.router.add_post('/api/new_task', api_new_task)
     app.router.add_get('/api/tasks', api_get_tasks)
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
     app.router.add_get('/health', health_check)
     app.router.add_get('/', home_page)
     
-    # Уведомление администратору
+    # 5. Уведомление администратору
     admin_id = os.getenv('ADMIN_ID')
     if admin_id:
         try:
-            await bot.send_message(admin_id, "🤖 Бот планировщика успешно запущен!")
+            await bot.send_message(admin_id, "🤖 Бот планировщика успешно запущен с webhook!")
         except:
             pass
     
     logger.info("=== Бот успешно запущен ===")
 
 async def main():
+    """Основная функция запуска"""
     await on_startup()
     
+    # Запускаем aiohttp сервер
     runner = web.AppRunner(app)
     await runner.setup()
     
@@ -231,15 +268,27 @@ async def main():
     await site.start()
     
     logger.info(f"🌐 Веб-сервер запущен на порту {port}")
+    logger.info(f"🔗 Webhook URL: {WEBHOOK_URL}")
     logger.info(f"🔗 API доступно по: /api/new_task и /api/tasks")
     
-    await dp.start_polling(bot)
+    # НЕ запускаем polling - используем только webhook
+    # Бот будет работать вечно через webhook
+    try:
+        # Просто ждем вечно
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        logger.info("Бот останавливается...")
+        # Удаляем webhook при остановке
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("✅ Webhook удален")
+        except:
+            pass
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен")
+        logger.info("Бот остановлен по команде пользователя")
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
-        raise
