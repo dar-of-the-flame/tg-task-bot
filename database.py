@@ -40,7 +40,9 @@ def init_db():
                 deleted_at TIMESTAMP,
                 emoji TEXT DEFAULT '📝',
                 remind_at TIMESTAMP,
-                reminder_sent BOOLEAN DEFAULT FALSE
+                reminder_sent BOOLEAN DEFAULT FALSE,
+                is_reminder BOOLEAN DEFAULT FALSE,
+                archived BOOLEAN DEFAULT FALSE
             )
         ''')
         
@@ -54,52 +56,77 @@ def init_db():
         return False
 
 def add_task(user_id, text, date=None, time=None, reminder=0, 
-             category='personal', priority='medium', emoji='📝'):
+             category='personal', priority='medium', emoji='📝',
+             is_reminder=False):
     """Добавляет задачу в БД. Возвращает ID созданной задачи или None."""
     try:
         conn = get_connection()
         cur = conn.cursor()
         
-        # Рассчитываем remind_at
+        # Рассчитываем remind_at - только для напоминаний
         remind_at = None
-        if date and time and reminder > 0:
+        if date and time and is_reminder:
             try:
-                task_datetime = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
-                remind_at = task_datetime - timedelta(minutes=reminder)
-            except ValueError:
+                # Создаём полную дату-время
+                if isinstance(date, str):
+                    task_datetime = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
+                else:
+                    # Если date уже datetime
+                    task_datetime = datetime.combine(date, datetime.strptime(time, "%H:%M").time())
+                
+                # Для обычных задач не устанавливаем напоминание
+                # Для напоминаний - точное время
+                remind_at = task_datetime
+            except Exception as e:
+                logger.error(f"Ошибка преобразования даты/времени: {e}")
                 remind_at = None
         
         cur.execute('''
             INSERT INTO tasks (user_id, text, category, priority, 
-                              date, time, reminder, emoji, remind_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                              date, time, reminder, emoji, remind_at, is_reminder)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
-        ''', (user_id, text, category, priority, date, time, reminder, emoji, remind_at))
+        ''', (user_id, text, category, priority, date, time, reminder, emoji, remind_at, is_reminder))
         
         task_id = cur.fetchone()['id']
         conn.commit()
         cur.close()
         conn.close()
-        logger.info(f"✅ Задача {task_id} добавлена для user_id={user_id}")
+        
+        logger.info(f"✅ Задача {task_id} добавлена для user_id={user_id}, тип: {'напоминание' if is_reminder else 'задача'}")
         return task_id
     except Exception as e:
         logger.error(f"❌ Ошибка добавления задачи: {e}")
         return None
 
-def get_tasks_by_user(user_id):
+def get_tasks_by_user(user_id, include_archived=False):
     """Возвращает все задачи пользователя."""
     try:
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute('''
-            SELECT id, user_id, text, category, priority, date, time,
-                   reminder, completed, deleted, created_at, completed_at,
-                   deleted_at, emoji
-            FROM tasks 
-            WHERE user_id = %s 
-            AND deleted = FALSE
-            ORDER BY date, time
-        ''', (user_id,))
+        
+        if include_archived:
+            cur.execute('''
+                SELECT id, user_id, text, category, priority, date, time,
+                       reminder, completed, deleted, created_at, completed_at,
+                       deleted_at, emoji, is_reminder, archived
+                FROM tasks 
+                WHERE user_id = %s 
+                AND deleted = FALSE
+                ORDER BY date, time
+            ''', (user_id,))
+        else:
+            cur.execute('''
+                SELECT id, user_id, text, category, priority, date, time,
+                       reminder, completed, deleted, created_at, completed_at,
+                       deleted_at, emoji, is_reminder, archived
+                FROM tasks 
+                WHERE user_id = %s 
+                AND deleted = FALSE
+                AND archived = FALSE
+                ORDER BY date, time
+            ''', (user_id,))
+        
         tasks = cur.fetchall()
         cur.close()
         conn.close()
@@ -108,7 +135,7 @@ def get_tasks_by_user(user_id):
         logger.error(f"❌ Ошибка получения задач: {e}")
         return []
 
-def update_task(task_id, user_id, completed=None, deleted=None):
+def update_task(task_id, user_id, completed=None, deleted=None, archived=None):
     """Обновляет задачу (отметка выполнения или удаление)."""
     try:
         conn = get_connection()
@@ -135,6 +162,13 @@ def update_task(task_id, user_id, completed=None, deleted=None):
                 WHERE id = %s AND user_id = %s
             ''', (task_id, user_id))
         
+        if archived is not None:
+            cur.execute('''
+                UPDATE tasks 
+                SET archived = %s 
+                WHERE id = %s AND user_id = %s
+            ''', (archived, task_id, user_id))
+        
         conn.commit()
         cur.close()
         conn.close()
@@ -145,15 +179,16 @@ def update_task(task_id, user_id, completed=None, deleted=None):
         return False
 
 def get_pending_reminders():
-    """Возвращает список задач, для которых пора отправить напоминание."""
+    """Возвращает список напоминаний, для которых пора отправить уведомление."""
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute('''
-            SELECT id, user_id, text, time
+            SELECT id, user_id, text
             FROM tasks 
             WHERE reminder_sent = FALSE 
-            AND remind_at <= NOW() 
+            AND is_reminder = TRUE
+            AND remind_at <= NOW()
             AND deleted = FALSE
             AND completed = FALSE
         ''')
@@ -176,3 +211,31 @@ def mark_reminder_sent(task_id):
         conn.close()
     except Exception as e:
         logger.error(f"❌ Ошибка обновления задачи {task_id}: {e}")
+
+def archive_overdue_tasks():
+    """Перемещает просроченные задачи в архив."""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        # Находим просроченные задачи (дата в прошлом, не выполнены, не удалены)
+        cur.execute('''
+            UPDATE tasks 
+            SET archived = TRUE
+            WHERE date < CURRENT_DATE
+            AND completed = FALSE
+            AND deleted = FALSE
+            AND archived = FALSE
+            AND is_reminder = FALSE
+        ''')
+        
+        affected_rows = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        logger.info(f"✅ Архивировано {affected_rows} просроченных задач")
+        return affected_rows
+    except Exception as e:
+        logger.error(f"❌ Ошибка архивации просроченных задач: {e}")
+        return 0
