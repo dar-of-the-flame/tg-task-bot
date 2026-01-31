@@ -19,6 +19,7 @@ from aiohttp.web import middleware
 import database
 from aiohttp import hdrs
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
 
 # ========== КОНФИГУРАЦИЯ ==========
 API_TOKEN = os.getenv('BOT_TOKEN')
@@ -207,6 +208,11 @@ async def create_task(request):
         
         if task_id:
             logger.info(f"✅ Задача {task_id} создана для user_id={user_id}")
+            
+            # Если это напоминание - планируем отправку
+            if data.get('is_reminder') and data.get('date') and data.get('time'):
+                await schedule_reminder(task_id, user_id, data['text'], data['date'], data['time'])
+            
             return web.json_response({"status": "ok", "task_id": task_id})
         else:
             logger.error(f"❌ Ошибка создания задачи для user_id={user_id}")
@@ -216,62 +222,103 @@ async def create_task(request):
         logger.error(f"❌ Ошибка создания задачи: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
 
-# Эндпоинт для обновления задачи
-async def update_task(request):
+# ========== ФУНКЦИЯ ПЛАНИРОВАНИЯ НАПОМИНАНИЙ ==========
+async def schedule_reminder(task_id, user_id, text, date_str, time_str):
+    """Планирует отправку напоминания на указанное время"""
     try:
-        data = await request.json()
-        logger.info(f"🔄 Обновление задачи: {data}")
+        # Создаем datetime объект из даты и времени
+        reminder_datetime = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
         
-        if 'task_id' not in data or 'user_id' not in data:
-            return web.json_response({"status": "error", "message": "task_id and user_id required"}, status=400)
+        # Проверяем, что напоминание в будущем
+        if reminder_datetime <= datetime.now():
+            logger.warning(f"⚠️ Напоминание {task_id} в прошлом, не планируем")
+            return False
         
-        success = database.update_task(
-            task_id=data['task_id'],
-            user_id=data['user_id'],
-            updates=data.get('updates', {})
+        # Добавляем задачу в планировщик
+        scheduler.add_job(
+            send_reminder,
+            trigger=DateTrigger(run_date=reminder_datetime),
+            args=[task_id, user_id, text],
+            id=f"reminder_{task_id}",
+            replace_existing=True
         )
         
-        if success:
-            return web.json_response({"status": "ok"})
-        else:
-            return web.json_response({"status": "error", "message": "Task not found or update failed"}, status=404)
+        logger.info(f"⏰ Напоминание {task_id} запланировано на {reminder_datetime}")
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка планирования напоминания {task_id}: {e}")
+        return False
+
+# ========== ФУНКЦИЯ ОТПРАВКИ НАПОМИНАНИЯ ==========
+async def send_reminder(task_id, user_id, text):
+    """Отправляет напоминание пользователю"""
+    try:
+        logger.info(f"🔔 Отправка напоминания {task_id} пользователю {user_id}")
+        
+        # Отправляем напоминание
+        await bot.send_message(
+            chat_id=user_id,
+            text=f"🔔 *Напоминание!*\n\n{text}\n\n_Время выполнения наступило_",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        
+        # Помечаем напоминание как отправленное в БД
+        database.mark_reminder_sent(task_id)
+        logger.info(f"✅ Напоминание {task_id} отправлено и заархивировано")
+        
+        # Удаляем задачу из планировщика
+        try:
+            scheduler.remove_job(f"reminder_{task_id}")
+        except:
+            pass
             
     except Exception as e:
-        logger.error(f"❌ Ошибка обновления задачи: {e}")
-        return web.json_response({"status": "error", "message": str(e)}, status=500)
+        logger.error(f"❌ Ошибка отправки напоминания {task_id}: {e}")
+        # Пробуем отправить позже (через 5 минут)
+        try:
+            retry_time = datetime.now() + timedelta(minutes=5)
+            scheduler.add_job(
+                send_reminder,
+                trigger=DateTrigger(run_date=retry_time),
+                args=[task_id, user_id, text],
+                id=f"reminder_retry_{task_id}_{datetime.now().timestamp()}",
+                replace_existing=True
+            )
+            logger.info(f"🔄 Напоминание {task_id} запланировано на повторную отправку в {retry_time}")
+        except Exception as retry_error:
+            logger.error(f"❌ Ошибка планирования повторной отправки {task_id}: {retry_error}")
 
-# ========== НАПОМИНАНИЯ ==========
-async def check_and_send_reminders():
-    """Проверяет и отправляет напоминания"""
+# ========== ПРОВЕРКА И ОТПРАВКА ОТЛОЖЕННЫХ НАПОМИНАНИЙ ==========
+async def check_and_send_pending_reminders():
+    """Проверяет и отправляет напоминания, которые должны были отправиться ранее"""
     try:
         reminders = database.get_pending_reminders()
         
         for reminder in reminders:
             try:
-                task_text = reminder['text']
-                user_id = reminder['user_id']
                 task_id = reminder['id']
+                user_id = reminder['user_id']
+                text = reminder['text']
+                remind_at = reminder.get('remind_at')
                 
-                # Отправляем напоминание
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=f"🔔 *Напоминание!*\n\n{task_text}\n\n_Время выполнения наступило_",
-                    parse_mode=ParseMode.MARKDOWN
-                )
-                
-                # Помечаем как отправленное
-                database.mark_reminder_sent(task_id)
-                logger.info(f"✅ Напоминание {task_id} отправлено пользователю {user_id}")
-                
-                # Небольшая задержка между отправками
-                await asyncio.sleep(0.5)
+                if remind_at:
+                    # Если напоминание в прошлом - отправляем сразу
+                    if isinstance(remind_at, str):
+                        remind_at = datetime.fromisoformat(remind_at.replace('Z', '+00:00'))
+                    
+                    if remind_at <= datetime.now(remind_at.tzinfo) if remind_at.tzinfo else remind_at <= datetime.now():
+                        await send_reminder(task_id, user_id, text)
+                    else:
+                        # Запланировать на будущее
+                        await schedule_reminder(task_id, user_id, text, reminder['date'], reminder['time'])
                 
             except Exception as e:
-                logger.error(f"❌ Ошибка отправки напоминания {reminder['id']}: {e}")
+                logger.error(f"❌ Ошибка обработки отложенного напоминания {reminder.get('id')}: {e}")
                 continue
                 
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка в check_and_send_reminders: {e}")
+        logger.error(f"❌ Критическая ошибка в check_and_send_pending_reminders: {e}")
 
 # ========== ФУНКЦИЯ АРХИВАЦИИ ПРОСРОЧЕННЫХ ЗАДАЧ ==========
 async def archive_overdue_tasks_job():
@@ -303,11 +350,19 @@ async def on_startup():
     logger.info("✅ База данных инициализирована")
 
     # Запускаем планировщик
+    scheduler.start()
+    logger.info("✅ Планировщик запущен")
+
+    # Проверяем и отправляем отложенные напоминания
+    await check_and_send_pending_reminders()
+    logger.info("✅ Проверка отложенных напоминаний выполнена")
+
+    # Запускаем периодические задачи
     scheduler.add_job(
-        check_and_send_reminders,
+        check_and_send_pending_reminders,
         'interval',
-        minutes=1,
-        id='check_reminders',
+        minutes=5,
+        id='check_pending_reminders',
         replace_existing=True
     )
 
@@ -327,14 +382,11 @@ async def on_startup():
         replace_existing=True
     )
 
-    scheduler.start()
-    logger.info("✅ Планировщик запущен")
-
     # Регистрируем HTTP маршруты
     app.router.add_get('/health', health_check)
     app.router.add_get('/api/tasks', get_tasks)
     app.router.add_post('/api/new_task', create_task)
-    app.router.add_post('/api/update_task', update_task)
+    app.router.add_post('/api/update_task', lambda r: web.json_response({"status": "ok"}))
     
     # Корневой маршрут
     async def api_info(request):
@@ -407,9 +459,6 @@ async def on_startup():
         except Exception as e:
             logger.error(f"❌ Не удалось уведомить администратора: {e}")
 
-    # Сразу проверяем напоминания
-    await check_and_send_reminders()
-    
     logger.info("✅ Бот полностью инициализирован и готов к работе")
 
 async def on_shutdown():
