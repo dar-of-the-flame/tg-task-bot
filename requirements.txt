@@ -3,4 +3,3 @@ aiohttp==3.9.1
 apscheduler==3.10.4
 psycopg2-binary==2.9.10
 python-dotenv==1.0.0
-aiohttp-cors==0.7.0
