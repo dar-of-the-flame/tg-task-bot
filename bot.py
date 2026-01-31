@@ -22,7 +22,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 API_TOKEN = os.getenv('BOT_TOKEN')
 WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
 WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_HOSTNAME')  # Получаем адрес Render.com
-WEBHOOK_PATH = f"/webhook/{API_TOKEN}"
+WEBHOOK_PATH = "/webhook"  # 👈 ИЗМЕНЕНО: Убрали токен из пути
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
@@ -283,14 +283,30 @@ async def on_startup():
     # Настраиваем webhook для Telegram
     if WEBHOOK_HOST:
         # Устанавливаем webhook
-        await bot.set_webhook(WEBHOOK_URL)
-        logger.info(f"🌐 Webhook установлен: {WEBHOOK_URL}")
+        try:
+            webhook_info = await bot.get_webhook_info()
+            logger.info(f"🔄 Текущий webhook: {webhook_info.url}")
+            
+            if webhook_info.url != WEBHOOK_URL:
+                await bot.set_webhook(WEBHOOK_URL, secret_token=API_TOKEN)  # 👈 Добавили secret_token
+                logger.info(f"🌐 Webhook установлен: {WEBHOOK_URL}")
+            else:
+                logger.info(f"✅ Webhook уже установлен")
+                
+            # Проверяем webhook
+            webhook_info = await bot.get_webhook_info()
+            logger.info(f"📊 Информация о webhook:")
+            logger.info(f"   URL: {webhook_info.url}")
+            logger.info(f"   Ожидает: {webhook_info.pending_update_count}")
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка настройки webhook: {e}")
         
         # Создаем обработчик для webhook
         webhook_handler = SimpleRequestHandler(
             dispatcher=dp,
             bot=bot,
-            secret_token=API_TOKEN
+            secret_token=API_TOKEN  # 👈 Secret токен для проверки
         )
         
         # Добавляем маршрут для webhook
@@ -325,8 +341,11 @@ async def on_shutdown():
     
     # Удаляем webhook
     if WEBHOOK_HOST:
-        await bot.delete_webhook()
-        logger.info("🌐 Webhook удален")
+        try:
+            await bot.delete_webhook()
+            logger.info("🌐 Webhook удален")
+        except Exception as e:
+            logger.error(f"❌ Ошибка удаления webhook: {e}")
     
     # Останавливаем планировщик
     scheduler.shutdown()
@@ -343,8 +362,9 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Получаем порт из переменной окружения (Render.com использует PORT)
+    # Получаем порт из переменной окружения (Render.com использует PORT=10000)
     port = int(os.getenv('PORT', 8080))
+    logger.info(f"🚀 Запуск сервера на порту {port}")
     
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
