@@ -1,10 +1,16 @@
-import os, asyncio, logging
+import os
+import asyncio
+import logging
 from datetime import datetime, timedelta
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 
 load_dotenv()
-@@ -9,13 +9,17 @@
+
+from aiogram import Bot, Dispatcher, Router, F
+from aiogram.types import Message, CallbackQuery, ParseMode
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.types import WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
@@ -22,7 +28,177 @@ WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-@@ -325,7 +329,6 @@ async def check_and_send_reminders():
+
+bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
+
+scheduler = AsyncIOScheduler()
+
+# ========== КОМАНДА START ==========
+@router.message(Command("start"))
+async def start_command(message: Message):
+    """Обработчик команды /start"""
+    user_id = message.from_user.id
+    logger.info(f"👤 Пользователь {user_id} запустил бота")
+
+    web_app = WebAppInfo(url=WEB_APP_URL)
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="📱 Открыть планировщик", web_app=web_app)]],
+        resize_keyboard=True,
+        one_time_keyboard=False
+    )
+
+    await message.answer(
+        f"🎯 *TaskFlow - Умный планировщик задач*\n\n"
+        f"Привет, {message.from_user.first_name}!\n\n"
+        f"Откройте веб-приложение для управления задачами.\n"
+        f"Все задачи синхронизируются и доступны везде.\n\n"
+        f"⚡ *Возможности:*\n"
+        f"• Создание задач с категориями и приоритетами\n"
+        f"• Установка даты и времени\n"
+        f"• Автоматические напоминания\n"
+        f"• Статистика и аналитика\n"
+        f"• Календарь и архивация",
+        reply_markup=keyboard,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ========== API ДЛЯ ВЕБ-ПРИЛОЖЕНИЯ ==========
+@router.message(F.web_app_data)
+async def handle_web_app_data(message: Message):
+    """Обработка данных из веб-приложения"""
+    try:
+        data = message.web_app_data.data
+        logger.info(f"📱 Данные из веб-приложения: {data}")
+        # Здесь можно обработать данные, если нужно
+        await message.answer("✅ Данные получены")
+    except Exception as e:
+        logger.error(f"❌ Ошибка обработки веб-данных: {e}")
+        await message.answer("❌ Ошибка обработки данных")
+
+# ========== API КОНЕЧНЫЕ ТОЧКИ ==========
+@dp.message(Command("api"))
+async def api_info(message: Message):
+    """Информация о доступных API"""
+    await message.answer(
+        "🔧 *Доступные API эндпоинты:*\n\n"
+        "`/api/new_task` - создать задачу (POST)\n"
+        "`/api/update_task` - обновить задачу (POST)\n"
+        "`/api/tasks` - получить все задачи (GET)\n"
+        "`/health` - проверка здоровья (GET)\n\n"
+        "📖 Документация: https://github.com/your-repo/docs",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ========== HTTP СЕРВЕР ДЛЯ API ==========
+app = web.Application()
+
+# Эндпоинт для проверки здоровья
+async def health_check(request):
+    return web.json_response({"status": "ok", "time": datetime.now().isoformat()})
+
+# Эндпоинт для получения задач
+async def get_tasks(request):
+    try:
+        user_id = request.query.get('user_id')
+        if not user_id:
+            return web.json_response({"status": "error", "message": "user_id required"}, status=400)
+        
+        tasks = database.get_tasks_by_user(int(user_id))
+        return web.json_response({"status": "ok", "tasks": tasks})
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения задач: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+# Эндпоинт для создания задачи
+async def create_task(request):
+    try:
+        data = await request.json()
+        logger.info(f"📝 Создание задачи: {data}")
+        
+        required_fields = ['user_id', 'text']
+        for field in required_fields:
+            if field not in data:
+                return web.json_response({"status": "error", "message": f"{field} required"}, status=400)
+        
+        task_id = database.add_task(
+            user_id=data['user_id'],
+            text=data['text'],
+            date=data.get('date'),
+            time=data.get('time'),
+            reminder=data.get('reminder', 0),
+            category=data.get('category', 'personal'),
+            priority=data.get('priority', 'medium'),
+            emoji=data.get('emoji', '📝'),
+            is_reminder=data.get('is_reminder', False),
+            task_type=data.get('task_type', 'task')
+        )
+        
+        if task_id:
+            return web.json_response({"status": "ok", "task_id": task_id})
+        else:
+            return web.json_response({"status": "error", "message": "Failed to create task"}, status=500)
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания задачи: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+# Эндпоинт для обновления задачи
+async def update_task(request):
+    try:
+        data = await request.json()
+        logger.info(f"🔄 Обновление задачи: {data}")
+        
+        if 'task_id' not in data or 'user_id' not in data:
+            return web.json_response({"status": "error", "message": "task_id and user_id required"}, status=400)
+        
+        success = database.update_task(
+            task_id=data['task_id'],
+            user_id=data['user_id'],
+            updates=data.get('updates', {})
+        )
+        
+        if success:
+            return web.json_response({"status": "ok"})
+        else:
+            return web.json_response({"status": "error", "message": "Task not found or update failed"}, status=404)
+            
+    except Exception as e:
+        logger.error(f"❌ Ошибка обновления задачи: {e}")
+        return web.json_response({"status": "error", "message": str(e)}, status=500)
+
+# ========== НАПОМИНАНИЯ ==========
+async def check_and_send_reminders():
+    """Проверяет и отправляет напоминания"""
+    try:
+        reminders = database.get_pending_reminders()
+        
+        for reminder in reminders:
+            try:
+                task_text = reminder['text']
+                user_id = reminder['user_id']
+                task_id = reminder['id']
+                
+                # Отправляем напоминание
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=f"🔔 *Напоминание!*\n\n{task_text}\n\n_Время выполнения наступило_",
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                # Помечаем как отправленное
+                database.mark_reminder_sent(task_id)
+                logger.info(f"✅ Напоминание {task_id} отправлено пользователю {user_id}")
+                
+                # Небольшая задержка между отправками
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"❌ Ошибка отправки напоминания {reminder['id']}: {e}")
+                continue
+                
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в check_and_send_reminders: {e}")
 
@@ -30,7 +206,9 @@ logger = logging.getLogger(__name__)
 async def archive_overdue_tasks_job():
     """Автоматическая архивация просроченных задач"""
     try:
-@@ -335,7 +338,6 @@ async def archive_overdue_tasks_job():
+        archived_count = database.archive_overdue_tasks()
+        if archived_count > 0:
+            logger.info(f"📦 Заархивировано {archived_count} просроченных задач")
     except Exception as e:
         logger.error(f"❌ Ошибка при архивации просроченных задач: {e}")
 
@@ -38,31 +216,68 @@ async def archive_overdue_tasks_job():
 async def cleanup_old_reminders_job():
     """Очищает старые отправленные напоминания"""
     try:
-@@ -355,7 +357,6 @@ async def on_startup():
+        cleaned_count = database.cleanup_old_reminders()
+        if cleaned_count > 0:
+            logger.info(f"🧹 Очищено {cleaned_count} старых напоминаний")
+    except Exception as e:
+        logger.error(f"❌ Ошибка очистки старых напоминаний: {e}")
+
+# ========== ЗАПУСК ПРИЛОЖЕНИЯ ==========
+async def on_startup():
+    """Действия при запуске бота"""
+    logger.info("=== Запуск бота ===")
+    
+    # Инициализируем БД
+    database.init_db()
     logger.info("✅ База данных инициализирована")
 
     # Запускаем планировщик
-    # 1. Проверка напоминаний каждую минуту
     scheduler.add_job(
         check_and_send_reminders,
         'interval',
-@@ -364,7 +365,6 @@ async def on_startup():
+        minutes=1,
+        id='check_reminders',
         replace_existing=True
     )
 
-    # 2. Архивация просроченных задач каждый час
     scheduler.add_job(
         archive_overdue_tasks_job,
         'interval',
-@@ -373,7 +373,6 @@ async def on_startup():
+        hours=1,
+        id='archive_tasks',
         replace_existing=True
     )
 
-    # 3. Очистка старых напоминаний раз в день
     scheduler.add_job(
         cleanup_old_reminders_job,
         'interval',
-@@ -411,6 +410,25 @@ async def api_info(request):
+        days=1,
+        id='cleanup_reminders',
+        replace_existing=True
+    )
+
+    scheduler.start()
+    logger.info("✅ Планировщик запущен")
+
+    # Регистрируем HTTP маршруты
+    app.router.add_get('/health', health_check)
+    app.router.add_get('/api/tasks', get_tasks)
+    app.router.add_post('/api/new_task', create_task)
+    app.router.add_post('/api/update_task', update_task)
+    
+    # Корневой маршрут
+    async def api_info(request):
+        return web.json_response({
+            "app": "TaskFlow Bot API",
+            "status": "running",
+            "endpoints": {
+                "GET /health": "Health check",
+                "GET /api/tasks?user_id=ID": "Get user tasks",
+                "POST /api/new_task": "Create new task",
+                "POST /api/update_task": "Update task"
+            }
+        })
+    
     app.router.add_get('/', api_info)
     app.router.add_get('/api', api_info)
 
@@ -88,16 +303,20 @@ async def cleanup_old_reminders_job():
     # Уведомление администратору
     admin_id = os.getenv('ADMIN_ID')
     if admin_id:
-@@ -421,7 +439,7 @@ async def api_info(request):
+        try:
+            await bot.send_message(
+                chat_id=admin_id,
+                text="🤖 *TaskFlow Bot запущен*\n\n"
                 "✅ База данных инициализирована\n"
                 "✅ Планировщик запущен\n"
                 "✅ API готово к работе\n"
-                "✅ Напоминания будут отправляться вовремя\n\n"
                 f"✅ Webhook: {'установлен' if WEBHOOK_HOST else 'не используется'}\n\n"
-                "🚀 Бот готов к работе!",
+                "🚀 Бот готов к работу!",
                 parse_mode=ParseMode.MARKDOWN
             )
-@@ -433,10 +451,26 @@ async def api_info(request):
+        except Exception as e:
+            logger.error(f"❌ Не удалось уведомить администратора: {e}")
+
     # Сразу проверяем напоминания
     await check_and_send_reminders()
 
@@ -124,13 +343,17 @@ async def main():
     # Запускаем aiohttp сервер
     runner = web.AppRunner(app)
     await runner.setup()
-@@ -457,15 +491,22 @@ async def main():
+    
+    # Получаем порт из переменной окружения (Render.com использует PORT)
+    port = int(os.getenv('PORT', 8080))
+    
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    bot_info = await bot.get_me()
     logger.info(f"🤖 Бот @{bot_info.username} запущен")
     logger.info(f"📱 WebApp URL: {WEB_APP_URL}")
 
-    # Запускаем бота (он будет работать вечно)
-    logger.info("🔄 Запускаем long-polling бота...")
-    await dp.start_polling(bot)
     # Запускаем бота в режиме webhook
     if WEBHOOK_HOST:
         logger.info("📡 Работаем в режиме webhook")
@@ -149,5 +372,4 @@ if __name__ == '__main__':
         asyncio.run(on_shutdown())
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
-        raise
         asyncio.run(on_shutdown())
