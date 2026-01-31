@@ -19,10 +19,7 @@ WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== ИСПРАВЛЕНИЕ: УНИКАЛЬНЫЙ ID ДЛЯ WEBHOOK ==========
-WEBHOOK_PATH = f"/webhook/{API_TOKEN.replace(':', '_')}"
-WEBHOOK_URL = f"https://tg-task-bot-service.onrender.com{WEBHOOK_PATH}"
-
+# ========== НАСТРОЙКА ==========
 bot = Bot(
     token=API_TOKEN,
     default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
@@ -35,20 +32,17 @@ app = web.Application()
 # ========== CORS MIDDLEWARE ==========
 async def cors_middleware(app, handler):
     async def middleware(request):
-        # Обрабатываем OPTIONS запросы (preflight)
         if request.method == "OPTIONS":
             response = web.Response()
         else:
             response = await handler(request)
         
-        # Добавляем CORS заголовки ко всем ответам
         response.headers['Access-Control-Allow-Origin'] = '*'
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
         return response
     return middleware
 
-# Применяем middleware
 app.middlewares.append(cors_middleware)
 
 # ========== TELEGRAM КОМАНДЫ ==========
@@ -72,12 +66,14 @@ async def cmd_status(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)[:100]}")
 
-# ========== API ==========
+# ========== API ЭНДПОИНТЫ ==========
 async def api_new_task(request):
+    """API для создания новой задачи"""
     try:
         data = await request.json()
         logger.info(f"📥 Получена задача: {data}")
         
+        # Валидация
         if 'user_id' not in data or 'text' not in data:
             return web.json_response(
                 {"status": "error", "message": "Не хватает user_id или text"},
@@ -87,7 +83,9 @@ async def api_new_task(request):
         user_id = data['user_id']
         task_text = data['text']
         category = data.get('category', 'personal')
+        priority = data.get('priority', 'medium')
         
+        # Маппинг категорий на emoji
         emoji_map = {
             'work': '💼',
             'personal': '👤', 
@@ -96,9 +94,11 @@ async def api_new_task(request):
         }
         emoji = emoji_map.get(category, '📌')
         
+        # Обработка времени напоминания
         reminder = data.get('reminder', 0)
         remind_at = datetime.now() + timedelta(minutes=reminder) if reminder > 0 else datetime.now()
         
+        # Формирование времени начала
         start_time = None
         if data.get('date'):
             date_str = data['date']
@@ -108,10 +108,11 @@ async def api_new_task(request):
             except:
                 start_time = datetime.now()
         
+        # Сохранение в БД
         task_id = await asyncio.to_thread(
             database.add_task, 
             user_id, emoji, task_text, remind_at,
-            start_time, None, category, data.get('priority', 'medium')
+            start_time, None, category, priority
         )
         
         if task_id:
@@ -134,6 +135,7 @@ async def api_new_task(request):
         )
 
 async def api_get_tasks(request):
+    """API для получения задач пользователя"""
     try:
         user_id = request.query.get('user_id')
         if not user_id:
@@ -142,11 +144,15 @@ async def api_get_tasks(request):
                 status=400
             )
         
+        # Получаем задачи из БД
         tasks = await asyncio.to_thread(database.get_user_tasks, user_id)
+        
+        logger.info(f"📤 Отправлено задач для user_id={user_id}: {len(tasks)}")
         
         return web.json_response({
             "status": "ok",
-            "tasks": tasks
+            "tasks": tasks,
+            "count": len(tasks)
         })
             
     except Exception as e:
@@ -156,41 +162,31 @@ async def api_get_tasks(request):
             status=500
         )
 
-# ========== WEBHOOK HANDLERS ==========
-async def set_webhook():
-    """Установка webhook для избежания конфликтов polling"""
-    try:
-        webhook_info = await bot.get_webhook_info()
-        if webhook_info.url != WEBHOOK_URL:
-            await bot.set_webhook(
-                url=WEBHOOK_URL,
-                drop_pending_updates=True
-            )
-            logger.info(f"✅ Webhook установлен: {WEBHOOK_URL}")
-        else:
-            logger.info(f"✅ Webhook уже установлен: {WEBHOOK_URL}")
-    except Exception as e:
-        logger.error(f"❌ Ошибка установки webhook: {e}")
-
-async def handle_webhook(request):
-    """Обработчик webhook от Telegram"""
-    try:
-        update = types.Update(**(await request.json()))
-        await dp.feed_update(bot=bot, update=update)
-        return web.Response()
-    except Exception as e:
-        logger.error(f"❌ Ошибка обработки webhook: {e}")
-        return web.Response(status=400)
-
-# ========== ЗДОРОВЬЕ И ГЛАВНАЯ ==========
+# ========== СЛУЖЕБНЫЕ ЭНДПОИНТЫ ==========
 async def health_check(request):
-    return web.Response(text="Bot is running")
+    """Проверка здоровья сервера"""
+    try:
+        # Проверяем подключение к БД
+        await asyncio.to_thread(database.get_connection)
+        return web.Response(text="Bot is running", status=200)
+    except Exception as e:
+        logger.error(f"❌ Health check failed: {e}")
+        return web.Response(text="Bot error", status=500)
 
 async def home_page(request):
-    return web.Response(text="TaskFlow Bot API is running")
+    """Главная страница"""
+    return web.Response(
+        text="TaskFlow Bot API v1.0\n"
+             "Endpoints:\n"
+             "- POST /api/new_task - создать задачу\n"
+             "- GET /api/tasks?user_id=... - получить задачи\n"
+             "- GET /health - проверка здоровья",
+        status=200
+    )
 
 # ========== НАПОМИНАНИЯ ==========
 async def check_and_send_reminders():
+    """Проверка и отправка напоминаний"""
     try:
         tasks = await asyncio.to_thread(database.get_pending_reminders)
         
@@ -215,16 +211,17 @@ async def check_and_send_reminders():
                 logger.error(f"   ❌ Ошибка отправки user_id={task['user_id']}: {e}")
                 
     except Exception as e:
-        logger.error(f"❌ Критическая ошибка в check_and_send_reminders: {e}")
+        logger.error(f"❌ Ошибка в check_and_send_reminders: {e}")
 
 # ========== ЗАПУСК ==========
 async def on_startup():
+    """Запуск приложения"""
     logger.info("=== Бот запускается ===")
     
-    # 1. Инициализация БД
+    # Инициализация БД
     await asyncio.to_thread(database.init_db)
     
-    # 2. Настройка планировщика напоминаний
+    # Запуск планировщика напоминаний
     scheduler.add_job(
         check_and_send_reminders,
         'interval',
@@ -235,31 +232,27 @@ async def on_startup():
     scheduler.start()
     logger.info("✅ Планировщик APScheduler запущен")
     
-    # 3. Установка webhook (вместо polling)
-    await set_webhook()
-    
-    # 4. Настройка маршрутов API
+    # Настройка маршрутов
     app.router.add_post('/api/new_task', api_new_task)
     app.router.add_get('/api/tasks', api_get_tasks)
-    app.router.add_post(WEBHOOK_PATH, handle_webhook)
     app.router.add_get('/health', health_check)
     app.router.add_get('/', home_page)
     
-    # 5. Уведомление администратору
+    # Уведомление администратору
     admin_id = os.getenv('ADMIN_ID')
     if admin_id:
         try:
-            await bot.send_message(admin_id, "🤖 Бот планировщика успешно запущен с webhook!")
+            await bot.send_message(admin_id, "🤖 Бот планировщика успешно запущен!")
         except:
             pass
     
     logger.info("=== Бот успешно запущен ===")
 
 async def main():
-    """Основная функция запуска"""
+    """Основная функция"""
     await on_startup()
     
-    # Запускаем aiohttp сервер
+    # Запуск веб-сервера
     runner = web.AppRunner(app)
     await runner.setup()
     
@@ -268,27 +261,22 @@ async def main():
     await site.start()
     
     logger.info(f"🌐 Веб-сервер запущен на порту {port}")
-    logger.info(f"🔗 Webhook URL: {WEBHOOK_URL}")
-    logger.info(f"🔗 API доступно по: /api/new_task и /api/tasks")
+    logger.info(f"🔗 API доступно:")
+    logger.info(f"   POST /api/new_task")
+    logger.info(f"   GET  /api/tasks?user_id=<id>")
+    logger.info(f"   GET  /health")
     
-    # НЕ запускаем polling - используем только webhook
-    # Бот будет работать вечно через webhook
+    # Держим приложение запущенным
     try:
-        # Просто ждем вечно
         await asyncio.Event().wait()
     except asyncio.CancelledError:
         logger.info("Бот останавливается...")
-        # Удаляем webhook при остановке
-        try:
-            await bot.delete_webhook(drop_pending_updates=True)
-            logger.info("✅ Webhook удален")
-        except:
-            pass
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен по команде пользователя")
+        logger.info("Бот остановлен")
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
+        raise
