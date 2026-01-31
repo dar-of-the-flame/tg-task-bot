@@ -28,6 +28,26 @@ dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 app = web.Application()
 
+# ========== CORS MIDDLEWARE ==========
+async def cors_middleware(app, handler):
+    async def middleware(request):
+        # Обрабатываем OPTIONS запросы (preflight)
+        if request.method == "OPTIONS":
+            response = web.Response()
+        else:
+            response = await handler(request)
+        
+        # Добавляем CORS заголовки ко всем ответам
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization'
+        return response
+    return middleware
+
+# Применяем middleware
+app.middlewares.append(cors_middleware)
+
+# ========== TELEGRAM КОМАНДЫ ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     keyboard = ReplyKeyboardMarkup(
@@ -48,8 +68,8 @@ async def cmd_status(message: types.Message):
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)[:100]}")
 
+# ========== API ==========
 async def api_new_task(request):
-    """API для приёма задач от фронтенда - ИСПРАВЛЕННЫЙ"""
     try:
         data = await request.json()
         logger.info(f"📥 Получена задача: {data}")
@@ -75,10 +95,20 @@ async def api_new_task(request):
         reminder = data.get('reminder', 0)
         remind_at = datetime.now() + timedelta(minutes=reminder) if reminder > 0 else datetime.now()
         
+        # Определяем дату и время из полей date и time
+        start_time = None
+        if data.get('date'):
+            date_str = data['date']
+            time_str = data.get('time', '00:00')
+            try:
+                start_time = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
+            except:
+                start_time = datetime.now()
+        
         task_id = await asyncio.to_thread(
             database.add_task, 
             user_id, emoji, task_text, remind_at,
-            None, None
+            start_time, None  # start_time, end_time
         )
         
         if task_id:
@@ -101,7 +131,6 @@ async def api_new_task(request):
         )
 
 async def api_get_tasks(request):
-    """API для получения задач пользователя"""
     try:
         user_id = request.query.get('user_id')
         if not user_id:
@@ -124,6 +153,14 @@ async def api_get_tasks(request):
             status=500
         )
 
+# ========== ЗДОРОВЬЕ И ГЛАВНАЯ ==========
+async def health_check(request):
+    return web.Response(text="Bot is running")
+
+async def home_page(request):
+    return web.Response(text="TaskFlow Bot API is running")
+
+# ========== НАПОМИНАНИЯ ==========
 async def check_and_send_reminders():
     try:
         tasks = await asyncio.to_thread(database.get_pending_reminders)
@@ -151,6 +188,7 @@ async def check_and_send_reminders():
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в check_and_send_reminders: {e}")
 
+# ========== ЗАПУСК ==========
 async def on_startup():
     logger.info("=== Бот запускается ===")
     
@@ -166,15 +204,13 @@ async def on_startup():
     scheduler.start()
     logger.info("✅ Планировщик APScheduler запущен")
     
+    # API маршруты
     app.router.add_post('/api/new_task', api_new_task)
     app.router.add_get('/api/tasks', api_get_tasks)
-    
-    async def health_check(request):
-        return web.Response(text="Bot is running")
-    
     app.router.add_get('/health', health_check)
-    app.router.add_get('/', health_check)
+    app.router.add_get('/', home_page)
     
+    # Уведомление администратору
     admin_id = os.getenv('ADMIN_ID')
     if admin_id:
         try:
