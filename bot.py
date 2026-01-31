@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import Message, CallbackQuery, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import Message, CallbackQuery, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
@@ -15,14 +15,16 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.filters import Command
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 from aiohttp import web
+from aiohttp.web import middleware
 import database
+from aiohttp import hdrs
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ========== КОНФИГУРАЦИЯ ==========
 API_TOKEN = os.getenv('BOT_TOKEN')
 WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
 WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_HOSTNAME')  # Получаем адрес Render.com
-WEBHOOK_PATH = "/webhook"  # 👈 ИЗМЕНЕНО: Убрали токен из пути
+WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
 logging.basicConfig(level=logging.INFO)
@@ -35,32 +37,85 @@ dp.include_router(router)
 
 scheduler = AsyncIOScheduler()
 
+# ========== CORS MIDDLEWARE ==========
+@middleware
+async def cors_middleware(request, handler):
+    # Обработка preflight запросов
+    if request.method == hdrs.METH_OPTIONS:
+        response = web.Response()
+    else:
+        response = await handler(request)
+    
+    # Добавляем CORS заголовки
+    response.headers.update({
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+        'Access-Control-Allow-Credentials': 'true'
+    })
+    
+    return response
+
 # ========== КОМАНДА START ==========
 @router.message(Command("start"))
 async def start_command(message: Message):
     """Обработчик команды /start"""
     user_id = message.from_user.id
     logger.info(f"👤 Пользователь {user_id} запустил бота")
-
-    web_app = WebAppInfo(url=WEB_APP_URL)
+    
+    # Создаем кнопку для открытия WebApp
+    web_app = WebAppInfo(url=f"{WEB_APP_URL}?startapp={user_id}")
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 Открыть планировщик", web_app=web_app)]],
         resize_keyboard=True,
         one_time_keyboard=False
     )
+    
+    # Также добавляем inline-кнопку
+    inline_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📱 Открыть WebApp", web_app=web_app)],
+            [InlineKeyboardButton(text="🆔 Мой ID", callback_data=f"userid_{user_id}")]
+        ]
+    )
 
     await message.answer(
         f"🎯 *TaskFlow - Умный планировщик задач*\n\n"
         f"Привет, {message.from_user.first_name}!\n\n"
-        f"Откройте веб-приложение для управления задачами.\n"
-        f"Все задачи синхронизируются и доступны везде.\n\n"
-        f"⚡ *Возможности:*\n"
-        f"• Создание задач с категориями и приоритетами\n"
-        f"• Установка даты и времени\n"
-        f"• Автоматические напоминания\n"
-        f"• Статистика и аналитика\n"
-        f"• Календарь и архивация",
+        f"📱 *Твой ID:* `{user_id}`\n"
+        f"🔑 *Сохрани этот ID для синхронизации*\n\n"
+        f"Нажми кнопку ниже, чтобы открыть планировщик:",
         reply_markup=keyboard,
+        parse_mode=ParseMode.MARKDOWN
+    )
+    
+    # Отправляем второе сообщение с inline-кнопкой
+    await message.answer(
+        "Или используй эту кнопку:",
+        reply_markup=inline_keyboard,
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ========== ПОЛУЧЕНИЕ USER ID ==========
+@router.callback_query(F.data.startswith("userid_"))
+async def get_user_id(callback: CallbackQuery):
+    user_id = callback.data.replace("userid_", "")
+    await callback.answer(f"Твой ID: {user_id}", show_alert=True)
+    await callback.message.answer(
+        f"📋 *Твой User ID:* `{user_id}`\n\n"
+        f"Сохрани этот номер. Он нужен для синхронизации задач.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+# ========== КОМАНДА MYID ==========
+@router.message(Command("myid"))
+async def myid_command(message: Message):
+    """Показывает ID пользователя"""
+    user_id = message.from_user.id
+    await message.answer(
+        f"📋 *Твой User ID:* `{user_id}`\n\n"
+        f"Сохрани этот номер. Он нужен для синхронизации задач.\n\n"
+        f"Используй его в WebApp если будет запрошен.",
         parse_mode=ParseMode.MARKDOWN
     )
 
@@ -70,29 +125,29 @@ async def handle_web_app_data(message: Message):
     """Обработка данных из веб-приложения"""
     try:
         data = message.web_app_data.data
-        logger.info(f"📱 Данные из веб-приложения: {data}")
-        # Здесь можно обработать данные, если нужно
-        await message.answer("✅ Данные получены")
+        user_id = message.from_user.id
+        logger.info(f"📱 Данные от user_id={user_id}: {data}")
+        
+        # Парсим JSON данные
+        import json
+        try:
+            data_json = json.loads(data)
+            logger.info(f"📊 JSON данные: {data_json}")
+        except:
+            logger.info(f"📊 Текстовые данные: {data}")
+        
+        await message.answer(
+            f"✅ Данные получены\n"
+            f"👤 Твой ID: `{user_id}`\n"
+            f"📊 Используй этот ID в WebApp",
+            parse_mode=ParseMode.MARKDOWN
+        )
     except Exception as e:
         logger.error(f"❌ Ошибка обработки веб-данных: {e}")
-        await message.answer("❌ Ошибка обработки данных")
-
-# ========== API КОНЕЧНЫЕ ТОЧКИ ==========
-@dp.message(Command("api"))
-async def api_info(message: Message):
-    """Информация о доступных API"""
-    await message.answer(
-        "🔧 *Доступные API эндпоинты:*\n\n"
-        "`/api/new_task` - создать задачу (POST)\n"
-        "`/api/update_task` - обновить задачу (POST)\n"
-        "`/api/tasks` - получить все задачи (GET)\n"
-        "`/health` - проверка здоровья (GET)\n\n"
-        "📖 Документация: https://github.com/your-repo/docs",
-        parse_mode=ParseMode.MARKDOWN
-    )
+        await message.answer(f"❌ Ошибка: {str(e)}")
 
 # ========== HTTP СЕРВЕР ДЛЯ API ==========
-app = web.Application()
+app = web.Application(middlewares=[cors_middleware])
 
 # Эндпоинт для проверки здоровья
 async def health_check(request):
@@ -106,7 +161,21 @@ async def get_tasks(request):
             return web.json_response({"status": "error", "message": "user_id required"}, status=400)
         
         tasks = database.get_tasks_by_user(int(user_id))
-        return web.json_response({"status": "ok", "tasks": tasks})
+        
+        # Преобразуем задачи в JSON-совместимый формат
+        tasks_list = []
+        for task in tasks:
+            task_dict = dict(task)
+            # Конвертируем datetime в строку
+            for key, value in task_dict.items():
+                if isinstance(value, datetime):
+                    task_dict[key] = value.isoformat()
+                elif isinstance(value, timedelta):
+                    task_dict[key] = str(value)
+            tasks_list.append(task_dict)
+        
+        logger.info(f"📊 Отправлено {len(tasks_list)} задач для user_id={user_id}")
+        return web.json_response({"status": "ok", "tasks": tasks_list})
     except Exception as e:
         logger.error(f"❌ Ошибка получения задач: {e}")
         return web.json_response({"status": "error", "message": str(e)}, status=500)
@@ -115,7 +184,8 @@ async def get_tasks(request):
 async def create_task(request):
     try:
         data = await request.json()
-        logger.info(f"📝 Создание задачи: {data}")
+        user_id = data.get('user_id')
+        logger.info(f"📝 Создание задачи для user_id={user_id}: {data}")
         
         required_fields = ['user_id', 'text']
         for field in required_fields:
@@ -136,8 +206,10 @@ async def create_task(request):
         )
         
         if task_id:
+            logger.info(f"✅ Задача {task_id} создана для user_id={user_id}")
             return web.json_response({"status": "ok", "task_id": task_id})
         else:
+            logger.error(f"❌ Ошибка создания задачи для user_id={user_id}")
             return web.json_response({"status": "error", "message": "Failed to create task"}, status=500)
             
     except Exception as e:
@@ -269,12 +341,14 @@ async def on_startup():
         return web.json_response({
             "app": "TaskFlow Bot API",
             "status": "running",
+            "version": "1.0",
             "endpoints": {
                 "GET /health": "Health check",
                 "GET /api/tasks?user_id=ID": "Get user tasks",
                 "POST /api/new_task": "Create new task",
                 "POST /api/update_task": "Update task"
-            }
+            },
+            "webhook": WEBHOOK_URL if WEBHOOK_HOST else "disabled"
         })
     
     app.router.add_get('/', api_info)
@@ -288,7 +362,7 @@ async def on_startup():
             logger.info(f"🔄 Текущий webhook: {webhook_info.url}")
             
             if webhook_info.url != WEBHOOK_URL:
-                await bot.set_webhook(WEBHOOK_URL, secret_token=API_TOKEN)  # 👈 Добавили secret_token
+                await bot.set_webhook(WEBHOOK_URL, secret_token=API_TOKEN)
                 logger.info(f"🌐 Webhook установлен: {WEBHOOK_URL}")
             else:
                 logger.info(f"✅ Webhook уже установлен")
@@ -298,6 +372,7 @@ async def on_startup():
             logger.info(f"📊 Информация о webhook:")
             logger.info(f"   URL: {webhook_info.url}")
             logger.info(f"   Ожидает: {webhook_info.pending_update_count}")
+            logger.info(f"   Ошибок: {webhook_info.last_error_message}")
             
         except Exception as e:
             logger.error(f"❌ Ошибка настройки webhook: {e}")
@@ -306,7 +381,7 @@ async def on_startup():
         webhook_handler = SimpleRequestHandler(
             dispatcher=dp,
             bot=bot,
-            secret_token=API_TOKEN  # 👈 Secret токен для проверки
+            secret_token=API_TOKEN
         )
         
         # Добавляем маршрут для webhook
@@ -334,6 +409,8 @@ async def on_startup():
 
     # Сразу проверяем напоминания
     await check_and_send_reminders()
+    
+    logger.info("✅ Бот полностью инициализирован и готов к работе")
 
 async def on_shutdown():
     """Действия при остановке бота"""
@@ -362,7 +439,7 @@ async def main():
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Получаем порт из переменной окружения (Render.com использует PORT=10000)
+    # Получаем порт из переменной окружения
     port = int(os.getenv('PORT', 8080))
     logger.info(f"🚀 Запуск сервера на порту {port}")
     
@@ -372,6 +449,7 @@ async def main():
     bot_info = await bot.get_me()
     logger.info(f"🤖 Бот @{bot_info.username} запущен")
     logger.info(f"📱 WebApp URL: {WEB_APP_URL}")
+    logger.info(f"🌐 API доступно по: https://{WEBHOOK_HOST}" if WEBHOOK_HOST else "🌐 API доступно локально")
 
     # Запускаем бота в режиме webhook
     if WEBHOOK_HOST:
