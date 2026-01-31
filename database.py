@@ -203,7 +203,7 @@ def get_pending_reminders():
         cur = conn.cursor()
         
         cur.execute('''
-            SELECT id, user_id, text, date, time, emoji
+            SELECT id, user_id, text, date, time, emoji, remind_at
             FROM tasks 
             WHERE reminder_sent = FALSE 
             AND is_reminder = TRUE
@@ -226,6 +226,27 @@ def get_pending_reminders():
     except Exception as e:
         logger.error(f"❌ Ошибка получения напоминаний: {e}")
         return []
+
+def get_task_by_id(task_id):
+    """Получает задачу по ID"""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        
+        cur.execute('''
+            SELECT id, user_id, text, date, time, emoji, remind_at, is_reminder
+            FROM tasks 
+            WHERE id = %s
+        ''', (task_id,))
+        
+        task = cur.fetchone()
+        cur.close()
+        conn.close()
+        
+        return task
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения задачи {task_id}: {e}")
+        return None
 
 def mark_reminder_sent(task_id):
     """Отмечает напоминание как отправленное и архивирует его"""
