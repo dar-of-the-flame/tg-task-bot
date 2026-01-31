@@ -41,16 +41,69 @@ async def cmd_start(message: types.Message):
 
 @dp.message(Command("test"))
 async def cmd_test(message: types.Message):
-    await message.answer("✅ Бот работает!")
+    await message.answer("✅ Бот работает! Используйте /start чтобы открыть планировщик.")
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
     """Проверка статуса бота"""
     try:
         await asyncio.to_thread(database.init_db)
-        await message.answer("✅ Бот и БД работают!")
+        await message.answer("✅ Бот и БД работают! Все системы в норме.")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)[:100]}")
+
+@dp.message(Command("help"))
+async def cmd_help(message: types.Message):
+    """Помощь по командам"""
+    help_text = """
+🤖 *Доступные команды:*
+
+/start - Открыть планировщик задач
+/test - Проверить работу бота
+/status - Статус бота и БД
+/help - Эта справка
+/today - Показать задачи на сегодня
+
+📝 *Как использовать:*
+1. Нажмите /start
+2. Нажмите кнопку "Открыть планировщик"
+3. Добавляйте задачи и напоминания
+4. Бот пришлёт напоминания вовремя!
+
+🔔 *Напоминания:*
+- Устанавливайте время напоминания
+- Бот отправит сообщение точно в срок
+- Напоминания приходят как обычные сообщения
+    """
+    await message.answer(help_text)
+
+@dp.message(Command("today"))
+async def cmd_today(message: types.Message):
+    """Показать задачи на сегодня"""
+    try:
+        user_id = message.from_user.id
+        today = datetime.now().strftime("%Y-%m-%d")
+        
+        tasks = await asyncio.to_thread(database.get_tasks_by_user, user_id)
+        
+        today_tasks = [t for t in tasks if t['date'] == today and not t['completed']]
+        
+        if not today_tasks:
+            await message.answer("🎉 На сегодня задач нет! Можете отдохнуть.")
+            return
+        
+        response = ["📅 *Задачи на сегодня:*\n"]
+        
+        for i, task in enumerate(today_tasks, 1):
+            time_str = f" ({task['time']})" if task['time'] else ""
+            status = "🔔" if task['is_reminder'] else "📝"
+            response.append(f"{i}. {status} {task['text']}{time_str}")
+        
+        await message.answer("\n".join(response))
+        
+    except Exception as e:
+        logger.error(f"Ошибка в команде /today: {e}")
+        await message.answer("❌ Не удалось получить задачи. Попробуйте позже.")
 
 # ========== API ==========
 async def api_new_task(request):
@@ -78,14 +131,44 @@ async def api_new_task(request):
         reminder = int(data.get('reminder', 0))
         emoji = data.get('emoji', '📝')
         is_reminder = data.get('is_reminder', False)
+        task_type = data.get('task_type', 'task')
+        
+        # Для напоминаний проверяем время
+        if is_reminder and (not date or not time):
+            return web.json_response(
+                {"status": "error", "message": "Для напоминания укажите дату и время"},
+                status=400
+            )
         
         # Сохраняем в БД
         task_id = await asyncio.to_thread(
             database.add_task, 
-            user_id, text, date, time, reminder, category, priority, emoji, is_reminder
+            user_id, text, date, time, reminder, category, 
+            priority, emoji, is_reminder, task_type
         )
         
         if task_id:
+            # Отправляем подтверждение пользователю в Telegram
+            try:
+                if is_reminder:
+                    time_str = f" {time}" if time else ""
+                    await bot.send_message(
+                        user_id,
+                        f"✅ Напоминание добавлено!\n\n"
+                        f"📝 *{text}*\n"
+                        f"📅 *Когда:* {date}{time_str}\n\n"
+                        f"Я пришлю вам сообщение точно в срок! 🔔"
+                    )
+                else:
+                    await bot.send_message(
+                        user_id,
+                        f"✅ Задача добавлена!\n\n"
+                        f"📝 *{text}*\n"
+                        f"🏷️ *Категория:* {category}"
+                    )
+            except Exception as e:
+                logger.warning(f"Не удалось отправить подтверждение пользователю {user_id}: {e}")
+            
             return web.json_response({
                 "status": "ok", 
                 "task_id": task_id,
@@ -121,11 +204,17 @@ async def api_get_tasks(request):
             for task in tasks:
                 for key in ['date', 'time', 'created_at', 'completed_at', 'deleted_at', 'remind_at']:
                     if task[key] and hasattr(task[key], 'isoformat'):
-                        task[key] = task[key].isoformat()
+                        if key == 'time':
+                            task[key] = task[key].strftime('%H:%M')
+                        elif key == 'date':
+                            task[key] = task[key].isoformat()
+                        else:
+                            task[key] = task[key].isoformat()
             
             return web.json_response({
                 "status": "ok",
-                "tasks": tasks
+                "tasks": tasks,
+                "count": len(tasks)
             })
             
         except Exception as e:
@@ -167,6 +256,15 @@ async def api_update_task(request):
         )
         
         if success:
+            # Отправляем уведомление об изменении статуса
+            try:
+                if completed:
+                    await bot.send_message(user_id, f"🎉 Задача выполнена! Так держать!")
+                elif deleted:
+                    await bot.send_message(user_id, f"🗑️ Задача удалена")
+            except:
+                pass
+            
             return web.json_response({"status": "ok"})
         else:
             return web.json_response(
@@ -188,24 +286,41 @@ async def check_and_send_reminders():
         tasks = await asyncio.to_thread(database.get_pending_reminders)
         
         if not tasks:
+            logger.debug("🔔 Нет напоминаний для отправки")
             return
             
         logger.info(f"🔔 Найдено напоминаний для отправки: {len(tasks)}")
         
         for task in tasks:
             try:
-                message = f"🔔 **Напоминание!**\n\n{task['text']}"
+                # Форматируем сообщение
+                emoji = task.get('emoji', '🔔')
+                time_str = f" ({task['time']})" if task.get('time') else ""
                 
-                await bot.send_message(
-                    chat_id=task['user_id'],
-                    text=message
+                message_text = (
+                    f"{emoji} *НАПОМИНАНИЕ!*\n\n"
+                    f"📝 *{task['text']}*\n"
                 )
                 
+                if task.get('date'):
+                    date_str = datetime.strptime(str(task['date']), "%Y-%m-%d").strftime("%d.%m.%Y")
+                    message_text += f"📅 *Когда:* {date_str}{time_str}\n"
+                
+                message_text += "\n_Сделайте это сейчас!_ ✨"
+                
+                # Отправляем сообщение
+                await bot.send_message(
+                    chat_id=task['user_id'],
+                    text=message_text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+                
+                # Помечаем как отправленное
                 await asyncio.to_thread(database.mark_reminder_sent, task['id'])
-                logger.info(f"   ✅ Напоминание отправлено user_id={task['user_id']}")
+                logger.info(f"   ✅ Напоминание отправлено user_id={task['user_id']} (задача {task['id']})")
                 
             except Exception as e:
-                logger.error(f"   ❌ Ошибка отправки напоминания user_id={task['user_id']}: {e}")
+                logger.error(f"   ❌ Ошибка отправки напоминания user_id={task.get('user_id')}: {e}")
                 
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в check_and_send_reminders: {e}")
@@ -220,6 +335,16 @@ async def archive_overdue_tasks_job():
     except Exception as e:
         logger.error(f"❌ Ошибка при архивации просроченных задач: {e}")
 
+# ========== ОЧИСТКА СТАРЫХ НАПОМИНАНИЙ ==========
+async def cleanup_old_reminders_job():
+    """Очищает старые отправленные напоминания"""
+    try:
+        cleaned_count = await asyncio.to_thread(database.cleanup_old_reminders)
+        if cleaned_count > 0:
+            logger.info(f"🧹 Удалено {cleaned_count} старых напоминаний")
+    except Exception as e:
+        logger.error(f"❌ Ошибка при очистке старых напоминаний: {e}")
+
 # ========== ЗАПУСК И НАСТРОЙКА ==========
 async def on_startup():
     """Действия при запуске бота"""
@@ -227,8 +352,10 @@ async def on_startup():
     
     # Инициализируем БД
     await asyncio.to_thread(database.init_db)
+    logger.info("✅ База данных инициализирована")
     
-    # Запускаем планировщик (проверка каждую минуту)
+    # Запускаем планировщик
+    # 1. Проверка напоминаний каждую минуту
     scheduler.add_job(
         check_and_send_reminders,
         'interval',
@@ -237,12 +364,21 @@ async def on_startup():
         replace_existing=True
     )
     
-    # Запускаем задачу архивации просроченных задач (раз в день)
+    # 2. Архивация просроченных задач каждый час
     scheduler.add_job(
         archive_overdue_tasks_job,
         'interval',
-        days=1,
+        hours=1,
         id="archive_check",
+        replace_existing=True
+    )
+    
+    # 3. Очистка старых напоминаний раз в день
+    scheduler.add_job(
+        cleanup_old_reminders_job,
+        'interval',
+        days=1,
+        id="cleanup_check",
         replace_existing=True
     )
     
@@ -256,20 +392,46 @@ async def on_startup():
     
     # Эндпоинты для проверки здоровья
     async def health_check(request):
-        return web.Response(text="Bot is running")
+        return web.Response(text="🤖 TaskFlow Bot is running!")
+    
+    async def api_info(request):
+        return web.json_response({
+            "status": "ok",
+            "service": "TaskFlow Telegram Bot",
+            "version": "2.0",
+            "endpoints": {
+                "POST /api/new_task": "Добавить новую задачу",
+                "GET /api/tasks?user_id=ID": "Получить задачи пользователя",
+                "POST /api/update_task": "Обновить задачу"
+            },
+            "telegram_commands": ["/start", "/help", "/today", "/status", "/test"]
+        })
     
     app.router.add_get('/health', health_check)
-    app.router.add_get('/', health_check)
+    app.router.add_get('/', api_info)
+    app.router.add_get('/api', api_info)
     
     # Уведомление администратору
     admin_id = os.getenv('ADMIN_ID')
     if admin_id:
         try:
-            await bot.send_message(admin_id, "🤖 Бот планировщика успешно запущен!")
-        except:
-            pass
+            await bot.send_message(
+                admin_id,
+                "🤖 *TaskFlow Bot успешно запущен!*\n\n"
+                "✅ База данных инициализирована\n"
+                "✅ Планировщик запущен\n"
+                "✅ API готово к работе\n"
+                "✅ Напоминания будут отправляться вовремя\n\n"
+                "🚀 Бот готов к работе!",
+                parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить администратора: {e}")
     
     logger.info("=== Бот успешно запущен ===")
+    
+    # Сразу проверяем напоминания
+    await check_and_send_reminders()
 
 async def main():
     """Основная функция запуска"""
@@ -286,18 +448,24 @@ async def main():
     
     logger.info(f"🌐 Веб-сервер запущен на порту {port}")
     logger.info(f"🔗 API доступно:")
-    logger.info(f"  - POST /api/new_task")
-    logger.info(f"  - GET  /api/tasks?user_id=ID")
-    logger.info(f"  - POST /api/update_task")
+    logger.info(f"  - POST /api/new_task - Добавить задачу")
+    logger.info(f"  - GET  /api/tasks?user_id=ID - Получить задачи")
+    logger.info(f"  - POST /api/update_task - Обновить задачу")
+    
+    # Информация о боте
+    bot_info = await bot.get_me()
+    logger.info(f"🤖 Бот @{bot_info.username} запущен")
+    logger.info(f"📱 WebApp URL: {WEB_APP_URL}")
     
     # Запускаем бота (он будет работать вечно)
+    logger.info("🔄 Запускаем long-polling бота...")
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Бот остановлен")
+        logger.info("⏹️ Бот остановлен пользователем")
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
         raise
