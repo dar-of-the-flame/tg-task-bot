@@ -10,11 +10,9 @@ logger = logging.getLogger(__name__)
 DATABASE_URL = os.getenv('DATABASE_URL')
 
 def get_connection():
-    """Создаёт синхронное подключение к БД."""
     return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
-    """Создаёт таблицу tasks при первом запуске."""
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -28,7 +26,11 @@ def init_db():
                 end_time TIMESTAMP,
                 remind_at TIMESTAMP NOT NULL,
                 reminder_sent BOOLEAN DEFAULT FALSE,
-                created_at TIMESTAMP DEFAULT NOW()
+                completed BOOLEAN DEFAULT FALSE,
+                deleted BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                completed_at TIMESTAMP,
+                deleted_at TIMESTAMP
             )
         ''')
         conn.commit()
@@ -41,7 +43,6 @@ def init_db():
         return False
 
 def add_task(user_id, emoji, task_text, remind_at, start_time=None, end_time=None):
-    """Добавляет задачу в БД. Возвращает ID созданной задачи или None."""
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -60,8 +61,47 @@ def add_task(user_id, emoji, task_text, remind_at, start_time=None, end_time=Non
         logger.error(f"❌ Ошибка добавления задачи: {e}")
         return None
 
+def get_user_tasks(user_id):
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute('''
+            SELECT id, user_id, emoji, task_text as text, 
+                   remind_at, start_time, end_time, 
+                   reminder_sent, completed, deleted,
+                   created_at, completed_at, deleted_at
+            FROM tasks 
+            WHERE user_id = %s
+            ORDER BY created_at DESC
+        ''', (user_id,))
+        tasks = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        result = []
+        for task in tasks:
+            result.append({
+                'id': task['id'],
+                'user_id': task['user_id'],
+                'emoji': task['emoji'],
+                'text': task['text'],
+                'category': 'personal',
+                'priority': 'medium',
+                'completed': task['completed'] or False,
+                'deleted': task['deleted'] or False,
+                'created_at': task['created_at'].isoformat() if task['created_at'] else None,
+                'completed_at': task['completed_at'].isoformat() if task['completed_at'] else None,
+                'deleted_at': task['deleted_at'].isoformat() if task['deleted_at'] else None,
+                'date': task['start_time'].date().isoformat() if task['start_time'] else None,
+                'time': task['start_time'].strftime('%H:%M') if task['start_time'] else ''
+            })
+        
+        return result
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения задач user_id={user_id}: {e}")
+        return []
+
 def get_pending_reminders():
-    """Возвращает список задач, для которых пора отправить напоминание."""
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -81,7 +121,6 @@ def get_pending_reminders():
         return []
 
 def mark_reminder_sent(task_id):
-    """Помечает напоминание как отправленное."""
     try:
         conn = get_connection()
         cur = conn.cursor()
