@@ -30,7 +30,9 @@ def init_db():
                 deleted BOOLEAN DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT NOW(),
                 completed_at TIMESTAMP,
-                deleted_at TIMESTAMP
+                deleted_at TIMESTAMP,
+                category TEXT DEFAULT 'personal',
+                priority TEXT DEFAULT 'medium'
             )
         ''')
         conn.commit()
@@ -42,15 +44,15 @@ def init_db():
         logger.error(f"❌ Ошибка инициализации БД: {e}")
         return False
 
-def add_task(user_id, emoji, task_text, remind_at, start_time=None, end_time=None):
+def add_task(user_id, emoji, task_text, remind_at, start_time=None, end_time=None, category='personal', priority='medium'):
     try:
         conn = get_connection()
         cur = conn.cursor()
         cur.execute('''
-            INSERT INTO tasks (user_id, emoji, task_text, remind_at, start_time, end_time)
-            VALUES (%s, %s, %s, %s, %s, %s)
+            INSERT INTO tasks (user_id, emoji, task_text, remind_at, start_time, end_time, category, priority)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
-        ''', (user_id, emoji, task_text, remind_at, start_time, end_time))
+        ''', (user_id, emoji, task_text, remind_at, start_time, end_time, category, priority))
         task_id = cur.fetchone()['id']
         conn.commit()
         cur.close()
@@ -67,9 +69,10 @@ def get_user_tasks(user_id):
         cur = conn.cursor()
         cur.execute('''
             SELECT id, user_id, emoji, task_text as text, 
-                   remind_at, start_time, end_time, 
+                   start_time, end_time, remind_at,
                    reminder_sent, completed, deleted,
-                   created_at, completed_at, deleted_at
+                   created_at, completed_at, deleted_at,
+                   category, priority
             FROM tasks 
             WHERE user_id = %s
             ORDER BY created_at DESC
@@ -80,20 +83,28 @@ def get_user_tasks(user_id):
         
         result = []
         for task in tasks:
+            # Форматируем дату и время для фронтенда
+            date_str = None
+            time_str = ''
+            if task['start_time']:
+                date_str = task['start_time'].date().isoformat()
+                time_str = task['start_time'].strftime('%H:%M')
+            
             result.append({
                 'id': task['id'],
                 'user_id': task['user_id'],
                 'emoji': task['emoji'],
                 'text': task['text'],
-                'category': 'personal',
-                'priority': 'medium',
+                'category': task['category'] or 'personal',
+                'priority': task['priority'] or 'medium',
                 'completed': task['completed'] or False,
                 'deleted': task['deleted'] or False,
                 'created_at': task['created_at'].isoformat() if task['created_at'] else None,
                 'completed_at': task['completed_at'].isoformat() if task['completed_at'] else None,
                 'deleted_at': task['deleted_at'].isoformat() if task['deleted_at'] else None,
-                'date': task['start_time'].date().isoformat() if task['start_time'] else None,
-                'time': task['start_time'].strftime('%H:%M') if task['start_time'] else ''
+                'date': date_str,
+                'time': time_str,
+                'reminder': 0  # Можно рассчитать из remind_at
             })
         
         return result
@@ -111,6 +122,8 @@ def get_pending_reminders():
             WHERE reminder_sent = FALSE 
             AND remind_at <= NOW() + INTERVAL '1 minute'
             AND remind_at > NOW() - INTERVAL '5 minutes'
+            AND completed = FALSE
+            AND deleted = FALSE
         ''')
         tasks = cur.fetchall()
         cur.close()
