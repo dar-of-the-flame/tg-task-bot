@@ -13,24 +13,21 @@ from aiohttp import web
 import database
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ========== КОНФИГУРАЦИЯ ==========
 API_TOKEN = os.getenv('BOT_TOKEN')
-WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"  # ЗАМЕНИ!
+WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== ИСПРАВЛЕНИЕ: новый способ создания бота ==========
 bot = Bot(
     token=API_TOKEN,
-    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)  # <-- ВОТ ЭТО
+    default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
 )
 
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 app = web.Application()
 
-# ========== TELEGRAM КОМАНДЫ ==========
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     keyboard = ReplyKeyboardMarkup(
@@ -45,47 +42,50 @@ async def cmd_test(message: types.Message):
 
 @dp.message(Command("status"))
 async def cmd_status(message: types.Message):
-    """Проверка статуса бота"""
     try:
         await asyncio.to_thread(database.init_db)
         await message.answer("✅ Бот и БД работают!")
     except Exception as e:
         await message.answer(f"❌ Ошибка: {str(e)[:100]}")
 
-# ========== API ==========
 async def api_new_task(request):
-    """API для приёма задач от фронтенда"""
+    """API для приёма задач от фронтенда - ИСПРАВЛЕННЫЙ"""
     try:
         data = await request.json()
         logger.info(f"📥 Получена задача: {data}")
         
-        # Базовые проверки
-        if 'user_id' not in data or 'task_text' not in data:
+        if 'user_id' not in data or 'text' not in data:
             return web.json_response(
-                {"status": "error", "message": "Не хватает user_id или task_text"},
+                {"status": "error", "message": "Не хватает user_id или text"},
                 status=400
             )
         
-        user_id = int(data['user_id'])
-        emoji = data.get('emoji', '📌')
-        task_text = data['task_text']
-        remind_in = int(data.get('remind_in_minutes', 0))
+        user_id = data['user_id']
+        task_text = data['text']
+        category = data.get('category', 'personal')
         
-        # Рассчитываем время напоминания
-        remind_at = datetime.now() + timedelta(minutes=remind_in)
+        emoji_map = {
+            'work': '💼',
+            'personal': '👤', 
+            'health': '❤️',
+            'study': '📚'
+        }
+        emoji = emoji_map.get(category, '📌')
         
-        # Сохраняем в БД
+        reminder = data.get('reminder', 0)
+        remind_at = datetime.now() + timedelta(minutes=reminder) if reminder > 0 else datetime.now()
+        
         task_id = await asyncio.to_thread(
             database.add_task, 
             user_id, emoji, task_text, remind_at,
-            data.get('start_time'), data.get('end_time')
+            None, None
         )
         
         if task_id:
             return web.json_response({
                 "status": "ok", 
                 "task_id": task_id,
-                "message": f"Задача добавлена! Напоминание в {remind_at.strftime('%H:%M')}"
+                "message": "Задача сохранена"
             })
         else:
             return web.json_response(
@@ -100,9 +100,31 @@ async def api_new_task(request):
             status=500
         )
 
-# ========== ФУНКЦИЯ РАССЫЛКИ НАПОМИНАНИЙ ==========
+async def api_get_tasks(request):
+    """API для получения задач пользователя"""
+    try:
+        user_id = request.query.get('user_id')
+        if not user_id:
+            return web.json_response(
+                {"status": "error", "message": "Не указан user_id"},
+                status=400
+            )
+        
+        tasks = await asyncio.to_thread(database.get_user_tasks, user_id)
+        
+        return web.json_response({
+            "status": "ok",
+            "tasks": tasks
+        })
+            
+    except Exception as e:
+        logger.error(f"❌ API get_tasks error: {e}")
+        return web.json_response(
+            {"status": "error", "message": str(e)[:100]},
+            status=500
+        )
+
 async def check_and_send_reminders():
-    """Проверяет и отправляет напоминания каждую минуту"""
     try:
         tasks = await asyncio.to_thread(database.get_pending_reminders)
         
@@ -129,15 +151,11 @@ async def check_and_send_reminders():
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в check_and_send_reminders: {e}")
 
-# ========== ЗАПУСК И НАСТРОЙКА ==========
 async def on_startup():
-    """Действия при запуске бота"""
     logger.info("=== Бот запускается ===")
     
-    # Инициализируем БД
     await asyncio.to_thread(database.init_db)
     
-    # Запускаем планировщик (проверка каждую минуту)
     scheduler.add_job(
         check_and_send_reminders,
         'interval',
@@ -148,17 +166,15 @@ async def on_startup():
     scheduler.start()
     logger.info("✅ Планировщик APScheduler запущен")
     
-    # Настраиваем API маршруты
     app.router.add_post('/api/new_task', api_new_task)
+    app.router.add_get('/api/tasks', api_get_tasks)
     
-    # Эндпоинты для проверки здоровья (для UptimeRobot)
     async def health_check(request):
         return web.Response(text="Bot is running")
     
     app.router.add_get('/health', health_check)
     app.router.add_get('/', health_check)
     
-    # Уведомление администратору
     admin_id = os.getenv('ADMIN_ID')
     if admin_id:
         try:
@@ -169,22 +185,18 @@ async def on_startup():
     logger.info("=== Бот успешно запущен ===")
 
 async def main():
-    """Основная функция запуска"""
     await on_startup()
     
-    # Запускаем aiohttp сервер
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Render сам назначает порт через переменную PORT
     port = int(os.getenv('PORT', 10000))
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
     
     logger.info(f"🌐 Веб-сервер запущен на порту {port}")
-    logger.info(f"🔗 API доступно по: /api/new_task")
+    logger.info(f"🔗 API доступно по: /api/new_task и /api/tasks")
     
-    # Запускаем бота (он будет работать вечно)
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
