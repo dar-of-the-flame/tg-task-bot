@@ -21,6 +21,8 @@ from aiohttp import hdrs
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 import json
+import secrets
+import string
 
 # ========== КОНФИГУРАЦИЯ ==========
 API_TOKEN = os.getenv('BOT_TOKEN')
@@ -28,6 +30,14 @@ WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
 WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_HOSTNAME')
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+# Генерация SECRET_TOKEN для webhook (должен содержать только A-Z, a-z, 0-9, _, -)
+SECRET_TOKEN = os.getenv('SECRET_TOKEN')
+if not SECRET_TOKEN:
+    # Генерируем безопасный токен
+    alphabet = string.ascii_letters + string.digits + '_-'
+    SECRET_TOKEN = ''.join(secrets.choice(alphabet) for _ in range(32))
+    logger.warning(f"⚠️ SECRET_TOKEN не задан, сгенерирован случайный")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -467,7 +477,7 @@ async def on_startup():
             webhook_info = await bot.get_webhook_info()
             
             if webhook_info.url != WEBHOOK_URL:
-                await bot.set_webhook(WEBHOOK_URL, secret_token=API_TOKEN)
+                await bot.set_webhook(WEBHOOK_URL, secret_token=SECRET_TOKEN)
                 logger.info(f"🌐 Webhook установлен: {WEBHOOK_URL}")
             else:
                 logger.info(f"✅ Webhook уже установлен")
@@ -478,7 +488,7 @@ async def on_startup():
         webhook_handler = SimpleRequestHandler(
             dispatcher=dp,
             bot=bot,
-            secret_token=API_TOKEN
+            secret_token=SECRET_TOKEN
         )
         
         webhook_handler.register(app, path=WEBHOOK_PATH)
@@ -531,7 +541,7 @@ async def main():
         runner = web.AppRunner(app)
         await runner.setup()
         
-        port = int(os.getenv('PORT', 8080))
+        port = int(os.getenv('PORT', 10000))
         logger.info(f"🚀 Запуск сервера на порту {port}")
         
         site = web.TCPSite(runner, '0.0.0.0', port)
