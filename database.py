@@ -10,15 +10,12 @@ logger = logging.getLogger(__name__)
 def get_connection():
     """Создает соединение с базой данных"""
     try:
-        # Используем DATABASE_URL из переменных окружения (Render.com предоставляет его)
         database_url = os.getenv('DATABASE_URL')
         if database_url:
-            # Преобразуем URL для psycopg2
             if database_url.startswith('postgres://'):
                 database_url = database_url.replace('postgres://', 'postgresql://', 1)
             return psycopg2.connect(database_url, cursor_factory=RealDictCursor)
         else:
-            # Для локальной разработки
             return psycopg2.connect(
                 dbname=os.getenv('DB_NAME', 'taskflow'),
                 user=os.getenv('DB_USER', 'postgres'),
@@ -61,10 +58,7 @@ def init_db():
             )
         ''')
 
-        # Создаем индекс для быстрого поиска по user_id
         cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)')
-        
-        # Создаем индекс для напоминаний
         cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_remind_at ON tasks(remind_at)')
         
         conn.commit()
@@ -79,7 +73,7 @@ def init_db():
 def add_task(user_id, text, date=None, time=None, reminder=0, 
              category='personal', priority='medium', emoji='📝',
              is_reminder=False, task_type='task'):
-    """Добавляет задачу в БД. Возвращает ID созданной задачи или None."""
+    """Добавляет задачу в БД"""
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -88,11 +82,13 @@ def add_task(user_id, text, date=None, time=None, reminder=0,
         remind_at = None
         if is_reminder and date and time:
             try:
-                # Создаём дату-время из даты и времени
+                # Время приходит в MSK (UTC+3), но база работает в UTC
+                # Конвертируем в UTC
                 task_datetime = datetime.strptime(f"{date} {time}", "%Y-%m-%d %H:%M")
-                # Устанавливаем remind_at как точное время напоминания
-                remind_at = task_datetime
-                logger.info(f"📅 Напоминание установлено на: {remind_at}")
+                # Вычитаем 3 часа для UTC
+                task_datetime_utc = task_datetime - timedelta(hours=3)
+                remind_at = task_datetime_utc
+                logger.info(f"📅 Напоминание установлено на: {date} {time} MSK (UTC+3)")
             except Exception as e:
                 logger.error(f"❌ Ошибка преобразования времени: {e}")
                 remind_at = None
@@ -168,7 +164,6 @@ def update_task(task_id, user_id, updates):
         conn = get_connection()
         cur = conn.cursor()
         
-        # Строим динамический запрос
         set_clause = []
         params = []
         
@@ -202,12 +197,13 @@ def get_pending_reminders():
         conn = get_connection()
         cur = conn.cursor()
         
+        # Ищем напоминания, у которых remind_at наступил (в UTC)
         cur.execute('''
             SELECT id, user_id, text, date, time, emoji, remind_at
             FROM tasks 
             WHERE reminder_sent = FALSE 
             AND is_reminder = TRUE
-            AND remind_at <= NOW()
+            AND remind_at <= NOW() AT TIME ZONE 'UTC'
             AND deleted = FALSE
             AND completed = FALSE
             AND archived = FALSE
@@ -226,27 +222,6 @@ def get_pending_reminders():
     except Exception as e:
         logger.error(f"❌ Ошибка получения напоминаний: {e}")
         return []
-
-def get_task_by_id(task_id):
-    """Получает задачу по ID"""
-    try:
-        conn = get_connection()
-        cur = conn.cursor()
-        
-        cur.execute('''
-            SELECT id, user_id, text, date, time, emoji, remind_at, is_reminder
-            FROM tasks 
-            WHERE id = %s
-        ''', (task_id,))
-        
-        task = cur.fetchone()
-        cur.close()
-        conn.close()
-        
-        return task
-    except Exception as e:
-        logger.error(f"❌ Ошибка получения задачи {task_id}: {e}")
-        return None
 
 def mark_reminder_sent(task_id):
     """Отмечает напоминание как отправленное и архивирует его"""
@@ -272,7 +247,6 @@ def archive_overdue_tasks():
         conn = get_connection()
         cur = conn.cursor()
 
-        # Находим просроченные задачи (дата в прошлом, не выполнены, не удалены, не напоминания)
         cur.execute('''
             UPDATE tasks 
             SET archived = TRUE
