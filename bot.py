@@ -6,6 +6,38 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ========== НАСТРОЙКА ЛОГГИРОВАНИЯ (ПЕРВЫМ ДЕЛОМ) ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# ========== КОНФИГУРАЦИЯ ==========
+API_TOKEN = os.getenv('BOT_TOKEN')
+WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
+WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_HOSTNAME')
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
+
+# Генерация SECRET_TOKEN для webhook
+SECRET_TOKEN = os.getenv('SECRET_TOKEN')
+if not SECRET_TOKEN:
+    # Допустимые символы: A-Z, a-z, 0-9, _, -
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits + '_-'
+    SECRET_TOKEN = ''.join(secrets.choice(alphabet) for _ in range(32))
+    logger.warning(f"⚠️ SECRET_TOKEN не задан, сгенерирован случайный: {SECRET_TOKEN}")
+
+# Проверка критических переменных
+if not API_TOKEN:
+    logger.error("❌ BOT_TOKEN не установлен!")
+if not WEBHOOK_HOST:
+    logger.warning("⚠️ WEBHOOK_HOST не установлен, бот будет работать без webhook")
+
+# ========== ИМПОРТЫ ПОСЛЕ НАСТРОЙКИ ЛОГГЕРА ==========
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.types import Message, CallbackQuery, WebAppInfo, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
@@ -21,27 +53,8 @@ from aiohttp import hdrs
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
 import json
-import secrets
-import string
 
-# ========== КОНФИГУРАЦИЯ ==========
-API_TOKEN = os.getenv('BOT_TOKEN')
-WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
-WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_HOSTNAME')
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
-
-# Генерация SECRET_TOKEN для webhook (должен содержать только A-Z, a-z, 0-9, _, -)
-SECRET_TOKEN = os.getenv('SECRET_TOKEN')
-if not SECRET_TOKEN:
-    # Генерируем безопасный токен
-    alphabet = string.ascii_letters + string.digits + '_-'
-    SECRET_TOKEN = ''.join(secrets.choice(alphabet) for _ in range(32))
-    logger.warning(f"⚠️ SECRET_TOKEN не задан, сгенерирован случайный")
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
+# ========== ИНИЦИАЛИЗАЦИЯ ==========
 bot = Bot(token=API_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
 dp = Dispatcher()
 router = Router()
