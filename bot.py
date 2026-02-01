@@ -368,7 +368,7 @@ async def check_and_send_pending_notifications():
                 task_id = notification['id']
                 user_id = notification['user_id']
                 text = notification['text']
-                task_type = notification['task_type']
+                task_type = notification['task_type'] if notification['task_type'] else ('reminder' if notification['is_reminder'] else 'task')
                 
                 # Отправляем уведомление
                 await send_notification(task_id, user_id, text, task_type)
@@ -388,41 +388,54 @@ async def on_startup():
     logger.info("=== Запуск бота ===")
     
     # Инициализируем БД
-    database.init_db()
-    logger.info("✅ База данных инициализирована")
+    try:
+        database.init_db()
+        logger.info("✅ База данных инициализирована")
+    except Exception as e:
+        logger.error(f"❌ Ошибка инициализации БД: {e}")
 
     # Запускаем планировщик
-    scheduler.start()
-    logger.info("✅ Планировщик запущен (часовой пояс: Europe/Moscow)")
+    try:
+        scheduler.start()
+        logger.info("✅ Планировщик запущен (часовой пояс: Europe/Moscow)")
+    except Exception as e:
+        logger.error(f"❌ Ошибка запуска планировщика: {e}")
 
     # Проверяем и отправляем отложенные уведомления
-    await check_and_send_pending_notifications()
-    logger.info("✅ Проверка отложенных уведомлений выполнена")
+    try:
+        await check_and_send_pending_notifications()
+        logger.info("✅ Проверка отложенных уведомлений выполнена")
+    except Exception as e:
+        logger.error(f"❌ Ошибка проверки отложенных уведомлений: {e}")
 
     # Запускаем периодические задачи
-    scheduler.add_job(
-        check_and_send_pending_notifications,
-        'interval',
-        minutes=5,
-        id='check_pending_notifications',
-        replace_existing=True
-    )
-
-    scheduler.add_job(
-        lambda: database.archive_overdue_tasks(),
-        'interval',
-        hours=1,
-        id='archive_tasks',
-        replace_existing=True
-    )
-
-    scheduler.add_job(
-        lambda: database.cleanup_old_reminders(),
-        'interval',
-        days=1,
-        id='cleanup_reminders',
-        replace_existing=True
-    )
+    try:
+        scheduler.add_job(
+            check_and_send_pending_notifications,
+            'interval',
+            minutes=5,
+            id='check_pending_notifications',
+            replace_existing=True
+        )
+        
+        scheduler.add_job(
+            lambda: database.archive_overdue_tasks(),
+            'interval',
+            hours=1,
+            id='archive_tasks',
+            replace_existing=True
+        )
+        
+        scheduler.add_job(
+            lambda: database.cleanup_old_reminders(),
+            'interval',
+            days=1,
+            id='cleanup_reminders',
+            replace_existing=True
+        )
+        logger.info("✅ Периодические задачи добавлены")
+    except Exception as e:
+        logger.error(f"❌ Ошибка добавления периодических задач: {e}")
 
     # Регистрируем HTTP маршруты
     app.router.add_get('/health', health_check)
@@ -502,41 +515,49 @@ async def on_shutdown():
         except Exception as e:
             logger.error(f"❌ Ошибка удаления webhook: {e}")
     
-    scheduler.shutdown()
-    logger.info("✅ Планировщик остановлен")
+    try:
+        if scheduler.running:
+            scheduler.shutdown(wait=False)
+            logger.info("✅ Планировщик остановлен")
+    except Exception as e:
+        logger.error(f"❌ Ошибка остановки планировщика: {e}")
 
 async def main():
-    await on_startup()
-
-    setup_application(app, dp, bot=bot)
-    
-    runner = web.AppRunner(app)
-    await runner.setup()
-    
-    port = int(os.getenv('PORT', 8080))
-    logger.info(f"🚀 Запуск сервера на порту {port}")
-    
-    site = web.TCPSite(runner, '0.0.0.0', port)
-    await site.start()
-    
-    bot_info = await bot.get_me()
-    logger.info(f"🤖 Бот @{bot_info.username} запущен")
-    logger.info(f"📱 WebApp URL: {WEB_APP_URL}")
-    logger.info(f"🌐 API доступно по: https://{WEBHOOK_HOST}" if WEBHOOK_HOST else "🌐 API доступно локально")
-
-    if WEBHOOK_HOST:
-        logger.info("📡 Работаем в режиме webhook")
-        await asyncio.Event().wait()
-    else:
-        logger.warning("⚠️ Работаем без webhook (режим long-polling)")
-        await dp.start_polling(bot)
-
-if __name__ == '__main__':
     try:
-        asyncio.run(main())
+        await on_startup()
+
+        setup_application(app, dp, bot=bot)
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        port = int(os.getenv('PORT', 8080))
+        logger.info(f"🚀 Запуск сервера на порту {port}")
+        
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        bot_info = await bot.get_me()
+        logger.info(f"🤖 Бот @{bot_info.username} запущен")
+        logger.info(f"📱 WebApp URL: {WEB_APP_URL}")
+        if WEBHOOK_HOST:
+            logger.info(f"🌐 API доступно по: https://{WEBHOOK_HOST}")
+        
+        if WEBHOOK_HOST:
+            logger.info("📡 Работаем в режиме webhook")
+            await asyncio.Event().wait()
+        else:
+            logger.warning("⚠️ Работаем без webhook (режим long-polling)")
+            await dp.start_polling(bot)
+            
     except KeyboardInterrupt:
         logger.info("⏹️ Бот остановлен пользователем")
-        asyncio.run(on_shutdown())
+        await on_shutdown()
     except Exception as e:
         logger.error(f"💥 Критическая ошибка: {e}")
-        asyncio.run(on_shutdown())
+        await on_shutdown()
+    finally:
+        logger.info("🏁 Завершение работы бота")
+
+if __name__ == '__main__':
+    asyncio.run(main())
