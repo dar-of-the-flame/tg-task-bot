@@ -24,7 +24,7 @@ from apscheduler.triggers.date import DateTrigger
 # ========== КОНФИГУРАЦИЯ ==========
 API_TOKEN = os.getenv('BOT_TOKEN')
 WEB_APP_URL = "https://dar-of-the-flame.github.io/tg-task-frontend/"
-WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_HOSTNAME')  # Получаем адрес Render.com
+WEBHOOK_HOST = os.getenv('RENDER_EXTERNAL_HOSTNAME')
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
@@ -36,18 +36,16 @@ dp = Dispatcher()
 router = Router()
 dp.include_router(router)
 
-scheduler = AsyncIOScheduler()
+scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
 
 # ========== CORS MIDDLEWARE ==========
 @middleware
 async def cors_middleware(request, handler):
-    # Обработка preflight запросов
     if request.method == hdrs.METH_OPTIONS:
         response = web.Response()
     else:
         response = await handler(request)
     
-    # Добавляем CORS заголовки
     response.headers.update({
         'Access-Control-Allow-Origin': '*',
         'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
@@ -60,11 +58,9 @@ async def cors_middleware(request, handler):
 # ========== КОМАНДА START ==========
 @router.message(Command("start"))
 async def start_command(message: Message):
-    """Обработчик команды /start"""
     user_id = message.from_user.id
     logger.info(f"👤 Пользователь {user_id} запустил бота")
     
-    # Создаем кнопку для открытия WebApp
     web_app = WebAppInfo(url=f"{WEB_APP_URL}?startapp={user_id}")
     keyboard = ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📱 Открыть планировщик", web_app=web_app)]],
@@ -72,7 +68,6 @@ async def start_command(message: Message):
         one_time_keyboard=False
     )
     
-    # Также добавляем inline-кнопку
     inline_keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📱 Открыть WebApp", web_app=web_app)],
@@ -90,7 +85,6 @@ async def start_command(message: Message):
         parse_mode=ParseMode.MARKDOWN
     )
     
-    # Отправляем второе сообщение с inline-кнопкой
     await message.answer(
         "Или используй эту кнопку:",
         reply_markup=inline_keyboard,
@@ -111,7 +105,6 @@ async def get_user_id(callback: CallbackQuery):
 # ========== КОМАНДА MYID ==========
 @router.message(Command("myid"))
 async def myid_command(message: Message):
-    """Показывает ID пользователя"""
     user_id = message.from_user.id
     await message.answer(
         f"📋 *Твой User ID:* `{user_id}`\n\n"
@@ -123,13 +116,11 @@ async def myid_command(message: Message):
 # ========== API ДЛЯ ВЕБ-ПРИЛОЖЕНИЯ ==========
 @router.message(F.web_app_data)
 async def handle_web_app_data(message: Message):
-    """Обработка данных из веб-приложения"""
     try:
         data = message.web_app_data.data
         user_id = message.from_user.id
         logger.info(f"📱 Данные от user_id={user_id}: {data}")
         
-        # Парсим JSON данные
         import json
         try:
             data_json = json.loads(data)
@@ -152,7 +143,7 @@ app = web.Application(middlewares=[cors_middleware])
 
 # Эндпоинт для проверки здоровья
 async def health_check(request):
-    return web.json_response({"status": "ok", "time": datetime.now().isoformat()})
+    return web.json_response({"status": "ok", "time": datetime.now(timezone.utc).isoformat()})
 
 # Эндпоинт для получения задач
 async def get_tasks(request):
@@ -163,11 +154,9 @@ async def get_tasks(request):
         
         tasks = database.get_tasks_by_user(int(user_id))
         
-        # Преобразуем задачи в JSON-совместимый формат
         tasks_list = []
         for task in tasks:
             task_dict = dict(task)
-            # Конвертируем datetime в строку
             for key, value in task_dict.items():
                 if isinstance(value, datetime):
                     task_dict[key] = value.isoformat()
@@ -193,11 +182,20 @@ async def create_task(request):
             if field not in data:
                 return web.json_response({"status": "error", "message": f"{field} required"}, status=400)
         
+        # Исправляем время для Москвы (UTC+3)
+        date = data.get('date')
+        time = data.get('time')
+        
+        if date and time:
+            # Пользователь вводит время в московском часовом поясе
+            # Мы сохраняем его как есть, бот будет работать в Moscow time
+            pass
+        
         task_id = database.add_task(
             user_id=data['user_id'],
             text=data['text'],
-            date=data.get('date'),
-            time=data.get('time'),
+            date=date,
+            time=time,
             reminder=data.get('reminder', 0),
             category=data.get('category', 'personal'),
             priority=data.get('priority', 'medium'),
@@ -209,9 +207,9 @@ async def create_task(request):
         if task_id:
             logger.info(f"✅ Задача {task_id} создана для user_id={user_id}")
             
-            # Если это напоминание - планируем отправку
-            if data.get('is_reminder') and data.get('date') and data.get('time'):
-                await schedule_reminder(task_id, user_id, data['text'], data['date'], data['time'])
+            # Если это напоминание - планируем отправку с поправкой на часовой пояс
+            if data.get('is_reminder') and date and time:
+                await schedule_reminder(task_id, user_id, data['text'], date, time)
             
             return web.json_response({"status": "ok", "task_id": task_id})
         else:
@@ -224,26 +222,33 @@ async def create_task(request):
 
 # ========== ФУНКЦИЯ ПЛАНИРОВАНИЯ НАПОМИНАНИЙ ==========
 async def schedule_reminder(task_id, user_id, text, date_str, time_str):
-    """Планирует отправку напоминания на указанное время"""
+    """Планирует отправку напоминания на указанное время (в часовом поясе Москвы)"""
     try:
-        # Создаем datetime объект из даты и времени
+        # Создаем datetime объект из даты и времени (считаем что время в Москве)
         reminder_datetime = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
         
+        # Преобразуем в UTC (Render.com работает в UTC, а время у нас в MSK)
+        # MSK = UTC+3, поэтому вычитаем 3 часа
+        reminder_datetime_utc = reminder_datetime - timedelta(hours=3)
+        
         # Проверяем, что напоминание в будущем
-        if reminder_datetime <= datetime.now():
-            logger.warning(f"⚠️ Напоминание {task_id} в прошлом, не планируем")
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+        if reminder_datetime_utc <= now_utc:
+            logger.warning(f"⚠️ Напоминание {task_id} в прошлом, отправляем сразу")
+            await send_reminder(task_id, user_id, text)
             return False
         
-        # Добавляем задачу в планировщик
+        # Добавляем задачу в планировщик (время в UTC)
         scheduler.add_job(
             send_reminder,
-            trigger=DateTrigger(run_date=reminder_datetime),
+            trigger=DateTrigger(run_date=reminder_datetime_utc),
             args=[task_id, user_id, text],
             id=f"reminder_{task_id}",
             replace_existing=True
         )
         
-        logger.info(f"⏰ Напоминание {task_id} запланировано на {reminder_datetime}")
+        moscow_time_str = reminder_datetime.strftime("%d.%m.%Y %H:%M")
+        logger.info(f"⏰ Напоминание {task_id} запланировано на {moscow_time_str} MSK (UTC+3)")
         return True
         
     except Exception as e:
@@ -252,7 +257,7 @@ async def schedule_reminder(task_id, user_id, text, date_str, time_str):
 
 # ========== ФУНКЦИЯ ОТПРАВКИ НАПОМИНАНИЯ ==========
 async def send_reminder(task_id, user_id, text):
-    """Отправляет напоминание пользователю"""
+    """Отправляет напоминание пользователю и архивирует его"""
     try:
         logger.info(f"🔔 Отправка напоминания {task_id} пользователю {user_id}")
         
@@ -263,7 +268,7 @@ async def send_reminder(task_id, user_id, text):
             parse_mode=ParseMode.MARKDOWN
         )
         
-        # Помечаем напоминание как отправленное в БД
+        # Помечаем напоминание как отправленное и архивируем
         database.mark_reminder_sent(task_id)
         logger.info(f"✅ Напоминание {task_id} отправлено и заархивировано")
         
@@ -277,7 +282,7 @@ async def send_reminder(task_id, user_id, text):
         logger.error(f"❌ Ошибка отправки напоминания {task_id}: {e}")
         # Пробуем отправить позже (через 5 минут)
         try:
-            retry_time = datetime.now() + timedelta(minutes=5)
+            retry_time = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=5)
             scheduler.add_job(
                 send_reminder,
                 trigger=DateTrigger(run_date=retry_time),
@@ -285,13 +290,13 @@ async def send_reminder(task_id, user_id, text):
                 id=f"reminder_retry_{task_id}_{datetime.now().timestamp()}",
                 replace_existing=True
             )
-            logger.info(f"🔄 Напоминание {task_id} запланировано на повторную отправку в {retry_time}")
+            logger.info(f"🔄 Напоминание {task_id} запланировано на повторную отправку")
         except Exception as retry_error:
             logger.error(f"❌ Ошибка планирования повторной отправки {task_id}: {retry_error}")
 
 # ========== ПРОВЕРКА И ОТПРАВКА ОТЛОЖЕННЫХ НАПОМИНАНИЙ ==========
 async def check_and_send_pending_reminders():
-    """Проверяет и отправляет напоминания, которые должны были отправиться ранее"""
+    """Проверяет и отправляет просроченные напоминания"""
     try:
         reminders = database.get_pending_reminders()
         
@@ -300,49 +305,22 @@ async def check_and_send_pending_reminders():
                 task_id = reminder['id']
                 user_id = reminder['user_id']
                 text = reminder['text']
-                remind_at = reminder.get('remind_at')
                 
-                if remind_at:
-                    # Если напоминание в прошлом - отправляем сразу
-                    if isinstance(remind_at, str):
-                        remind_at = datetime.fromisoformat(remind_at.replace('Z', '+00:00'))
-                    
-                    if remind_at <= datetime.now(remind_at.tzinfo) if remind_at.tzinfo else remind_at <= datetime.now():
-                        await send_reminder(task_id, user_id, text)
-                    else:
-                        # Запланировать на будущее
-                        await schedule_reminder(task_id, user_id, text, reminder['date'], reminder['time'])
+                # Отправляем напоминание и архивируем
+                await send_reminder(task_id, user_id, text)
+                
+                # Небольшая задержка между отправками
+                await asyncio.sleep(0.5)
                 
             except Exception as e:
-                logger.error(f"❌ Ошибка обработки отложенного напоминания {reminder.get('id')}: {e}")
+                logger.error(f"❌ Ошибка обработки напоминания {reminder.get('id')}: {e}")
                 continue
                 
     except Exception as e:
         logger.error(f"❌ Критическая ошибка в check_and_send_pending_reminders: {e}")
 
-# ========== ФУНКЦИЯ АРХИВАЦИИ ПРОСРОЧЕННЫХ ЗАДАЧ ==========
-async def archive_overdue_tasks_job():
-    """Автоматическая архивация просроченных задач"""
-    try:
-        archived_count = database.archive_overdue_tasks()
-        if archived_count > 0:
-            logger.info(f"📦 Заархивировано {archived_count} просроченных задач")
-    except Exception as e:
-        logger.error(f"❌ Ошибка при архивации просроченных задач: {e}")
-
-# ========== ОЧИСТКА СТАРЫХ НАПОМИНАНИЙ ==========
-async def cleanup_old_reminders_job():
-    """Очищает старые отправленные напоминания"""
-    try:
-        cleaned_count = database.cleanup_old_reminders()
-        if cleaned_count > 0:
-            logger.info(f"🧹 Очищено {cleaned_count} старых напоминаний")
-    except Exception as e:
-        logger.error(f"❌ Ошибка очистки старых напоминаний: {e}")
-
 # ========== ЗАПУСК ПРИЛОЖЕНИЯ ==========
 async def on_startup():
-    """Действия при запуске бота"""
     logger.info("=== Запуск бота ===")
     
     # Инициализируем БД
@@ -351,7 +329,7 @@ async def on_startup():
 
     # Запускаем планировщик
     scheduler.start()
-    logger.info("✅ Планировщик запущен")
+    logger.info("✅ Планировщик запущен (часовой пояс: Europe/Moscow)")
 
     # Проверяем и отправляем отложенные напоминания
     await check_and_send_pending_reminders()
@@ -367,7 +345,7 @@ async def on_startup():
     )
 
     scheduler.add_job(
-        archive_overdue_tasks_job,
+        lambda: database.archive_overdue_tasks(),
         'interval',
         hours=1,
         id='archive_tasks',
@@ -375,7 +353,7 @@ async def on_startup():
     )
 
     scheduler.add_job(
-        cleanup_old_reminders_job,
+        lambda: database.cleanup_old_reminders(),
         'interval',
         days=1,
         id='cleanup_reminders',
@@ -394,24 +372,22 @@ async def on_startup():
             "app": "TaskFlow Bot API",
             "status": "running",
             "version": "1.0",
+            "timezone": "Europe/Moscow (UTC+3)",
             "endpoints": {
                 "GET /health": "Health check",
                 "GET /api/tasks?user_id=ID": "Get user tasks",
                 "POST /api/new_task": "Create new task",
                 "POST /api/update_task": "Update task"
-            },
-            "webhook": WEBHOOK_URL if WEBHOOK_HOST else "disabled"
+            }
         })
     
     app.router.add_get('/', api_info)
     app.router.add_get('/api', api_info)
 
-    # Настраиваем webhook для Telegram
+    # Настраиваем webhook
     if WEBHOOK_HOST:
-        # Устанавливаем webhook
         try:
             webhook_info = await bot.get_webhook_info()
-            logger.info(f"🔄 Текущий webhook: {webhook_info.url}")
             
             if webhook_info.url != WEBHOOK_URL:
                 await bot.set_webhook(WEBHOOK_URL, secret_token=API_TOKEN)
@@ -419,24 +395,15 @@ async def on_startup():
             else:
                 logger.info(f"✅ Webhook уже установлен")
                 
-            # Проверяем webhook
-            webhook_info = await bot.get_webhook_info()
-            logger.info(f"📊 Информация о webhook:")
-            logger.info(f"   URL: {webhook_info.url}")
-            logger.info(f"   Ожидает: {webhook_info.pending_update_count}")
-            logger.info(f"   Ошибок: {webhook_info.last_error_message}")
-            
         except Exception as e:
             logger.error(f"❌ Ошибка настройки webhook: {e}")
         
-        # Создаем обработчик для webhook
         webhook_handler = SimpleRequestHandler(
             dispatcher=dp,
             bot=bot,
             secret_token=API_TOKEN
         )
         
-        # Добавляем маршрут для webhook
         webhook_handler.register(app, path=WEBHOOK_PATH)
         logger.info(f"📡 Webhook маршрут зарегистрирован: {WEBHOOK_PATH}")
     else:
@@ -452,7 +419,7 @@ async def on_startup():
                 "✅ База данных инициализирована\n"
                 "✅ Планировщик запущен\n"
                 "✅ API готово к работе\n"
-                f"✅ Webhook: {'установлен' if WEBHOOK_HOST else 'не используется'}\n\n"
+                "⏰ Часовой пояс: Europe/Moscow (UTC+3)\n\n"
                 "🚀 Бот готов к работе!",
                 parse_mode=ParseMode.MARKDOWN
             )
@@ -462,10 +429,8 @@ async def on_startup():
     logger.info("✅ Бот полностью инициализирован и готов к работе")
 
 async def on_shutdown():
-    """Действия при остановке бота"""
     logger.info("=== Остановка бота ===")
     
-    # Удаляем webhook
     if WEBHOOK_HOST:
         try:
             await bot.delete_webhook()
@@ -473,22 +438,17 @@ async def on_shutdown():
         except Exception as e:
             logger.error(f"❌ Ошибка удаления webhook: {e}")
     
-    # Останавливаем планировщик
     scheduler.shutdown()
     logger.info("✅ Планировщик остановлен")
 
 async def main():
-    """Основная функция запуска"""
     await on_startup()
 
-    # Настраиваем aiohttp приложение
     setup_application(app, dp, bot=bot)
     
-    # Запускаем aiohttp сервер
     runner = web.AppRunner(app)
     await runner.setup()
     
-    # Получаем порт из переменной окружения
     port = int(os.getenv('PORT', 8080))
     logger.info(f"🚀 Запуск сервера на порту {port}")
     
@@ -500,14 +460,11 @@ async def main():
     logger.info(f"📱 WebApp URL: {WEB_APP_URL}")
     logger.info(f"🌐 API доступно по: https://{WEBHOOK_HOST}" if WEBHOOK_HOST else "🌐 API доступно локально")
 
-    # Запускаем бота в режиме webhook
     if WEBHOOK_HOST:
         logger.info("📡 Работаем в режиме webhook")
-        # Бот будет работать через webhook, просто держим сервер запущенным
         await asyncio.Event().wait()
     else:
         logger.warning("⚠️ Работаем без webhook (режим long-polling)")
-        # Если нет webhook, используем long-polling (для локальной разработки)
         await dp.start_polling(bot)
 
 if __name__ == '__main__':
