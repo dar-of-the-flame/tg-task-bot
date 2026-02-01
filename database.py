@@ -29,11 +29,12 @@ def get_connection():
 
 def init_db():
     """Инициализация таблиц в базе данных"""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         
-        # Создаем таблицу задач
+        # Создаем таблицу задач (без колонки status сначала)
         cur.execute('''
             CREATE TABLE IF NOT EXISTS tasks (
                 id SERIAL PRIMARY KEY,
@@ -54,51 +55,49 @@ def init_db():
                 reminder_sent BOOLEAN DEFAULT FALSE,
                 is_reminder BOOLEAN DEFAULT FALSE,
                 archived BOOLEAN DEFAULT FALSE,
-                task_type TEXT DEFAULT 'task',
-                status TEXT DEFAULT 'active'
+                task_type TEXT DEFAULT 'task'
             )
         ''')
-
-        # Создаем индексы (используем IF NOT EXISTS для PostgreSQL)
-        try:
-            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)')
-            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_remind_at ON tasks(remind_at)')
-            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)')
-        except Exception as e:
-            logger.warning(f"⚠️ Ошибка создания индекса, возможно уже существует: {e}")
-            # Если индексы уже существуют, продолжаем
         
-        # Проверяем и добавляем недостающие колонки
+        # Проверяем наличие колонки status и добавляем если нет
         try:
-            # Проверяем наличие колонки status
-            cur.execute("""
-                SELECT column_name 
-                FROM information_schema.columns 
-                WHERE table_name='tasks' AND column_name='status'
-            """)
+            cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='tasks' AND column_name='status'")
             if not cur.fetchone():
                 cur.execute('ALTER TABLE tasks ADD COLUMN status TEXT DEFAULT \'active\'')
                 logger.info("✅ Добавлена колонка status")
         except Exception as e:
             logger.warning(f"⚠️ Ошибка проверки/добавления колонки status: {e}")
         
+        # Создаем индексы
+        try:
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_remind_at ON tasks(remind_at)')
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка создания базовых индексов: {e}")
+        
+        # Пробуем создать индекс для status (может не существовать если колонка не добавилась)
+        try:
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)')
+        except:
+            pass  # Игнорируем ошибку если колонки status нет
+        
         conn.commit()
-        cur.close()
-        conn.close()
         logger.info("✅ База данных инициализирована")
         
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации БД: {e}")
-        # Не падаем полностью, возможно таблица уже создана
-        try:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if conn:
             conn.close()
-        except:
-            pass
 
 def add_task(user_id, text, date=None, time=None, reminder=0, 
              category='personal', priority='medium', emoji='📝',
              is_reminder=False, task_type='task'):
     """Добавляет задачу в БД"""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -117,32 +116,44 @@ def add_task(user_id, text, date=None, time=None, reminder=0,
                 logger.error(f"❌ Ошибка преобразования времени: {e}")
                 remind_at = None
 
-        cur.execute('''
-            INSERT INTO tasks (user_id, text, category, priority, 
-                              date, time, reminder, emoji, remind_at, 
-                              is_reminder, task_type, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active')
-            RETURNING id
-        ''', (user_id, text, category, priority, date, time, 
-              reminder, emoji, remind_at, is_reminder, task_type))
+        # Пробуем вставить с колонкой status
+        try:
+            cur.execute('''
+                INSERT INTO tasks (user_id, text, category, priority, 
+                                  date, time, reminder, emoji, remind_at, 
+                                  is_reminder, task_type, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'active')
+                RETURNING id
+            ''', (user_id, text, category, priority, date, time, 
+                  reminder, emoji, remind_at, is_reminder, task_type))
+        except:
+            # Если нет колонки status, вставляем без нее
+            cur.execute('''
+                INSERT INTO tasks (user_id, text, category, priority, 
+                                  date, time, reminder, emoji, remind_at, 
+                                  is_reminder, task_type)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            ''', (user_id, text, category, priority, date, time, 
+                  reminder, emoji, remind_at, is_reminder, task_type))
 
         task_id = cur.fetchone()['id']
         conn.commit()
-        cur.close()
-        conn.close()
 
         logger.info(f"✅ Задача {task_id} добавлена для user_id={user_id}, тип: {task_type}")
         return task_id
     except Exception as e:
         logger.error(f"❌ Ошибка добавления задачи: {e}")
-        try:
-            conn.close()
-        except:
-            pass
+        if conn:
+            conn.rollback()
         return None
+    finally:
+        if conn:
+            conn.close()
 
 def get_tasks_by_user(user_id, include_archived=False):
     """Получает задачи пользователя"""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -151,7 +162,7 @@ def get_tasks_by_user(user_id, include_archived=False):
             cur.execute('''
                 SELECT id, user_id, text, category, priority, date, time,
                       reminder, completed, deleted, created_at, completed_at,
-                      deleted_at, emoji, is_reminder, archived, task_type, status
+                      deleted_at, emoji, is_reminder, archived, task_type
                 FROM tasks 
                 WHERE user_id = %s 
                 AND deleted = FALSE
@@ -165,12 +176,11 @@ def get_tasks_by_user(user_id, include_archived=False):
             cur.execute('''
                 SELECT id, user_id, text, category, priority, date, time,
                       reminder, completed, deleted, created_at, completed_at,
-                      deleted_at, emoji, is_reminder, archived, task_type, status
+                      deleted_at, emoji, is_reminder, archived, task_type
                 FROM tasks 
                 WHERE user_id = %s 
                 AND deleted = FALSE
                 AND archived = FALSE
-                AND (status IS NULL OR status != 'archived')
                 ORDER BY 
                     CASE WHEN date IS NULL THEN 1 ELSE 0 END,
                     date,
@@ -179,20 +189,17 @@ def get_tasks_by_user(user_id, include_archived=False):
             ''', (user_id,))
 
         tasks = cur.fetchall()
-        cur.close()
-        conn.close()
-        
         return tasks
     except Exception as e:
         logger.error(f"❌ Ошибка получения задач: {e}")
-        try:
-            conn.close()
-        except:
-            pass
         return []
+    finally:
+        if conn:
+            conn.close()
 
 def update_task(task_id, user_id, updates):
     """Обновляет задачу"""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -216,20 +223,20 @@ def update_task(task_id, user_id, updates):
         cur.execute(query, params)
         result = cur.fetchone()
         conn.commit()
-        cur.close()
-        conn.close()
         
         return result is not None
     except Exception as e:
         logger.error(f"❌ Ошибка обновления задачи: {e}")
-        try:
-            conn.close()
-        except:
-            pass
+        if conn:
+            conn.rollback()
         return False
+    finally:
+        if conn:
+            conn.close()
 
 def update_task_status(task_id, status):
     """Обновляет статус задачи"""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -239,8 +246,7 @@ def update_task_status(task_id, status):
                 UPDATE tasks 
                 SET completed = TRUE,
                     completed_at = CURRENT_TIMESTAMP,
-                    archived = TRUE,
-                    status = 'completed'
+                    archived = TRUE
                 WHERE id = %s
                 RETURNING id
             ''', (task_id,))
@@ -248,42 +254,41 @@ def update_task_status(task_id, status):
             cur.execute('''
                 UPDATE tasks 
                 SET completed = FALSE,
-                    archived = FALSE,
-                    status = 'in_progress'
+                    archived = FALSE
                 WHERE id = %s
                 RETURNING id
             ''', (task_id,))
         elif status == 'archived':
             cur.execute('''
                 UPDATE tasks 
-                SET archived = TRUE,
-                    status = 'archived'
+                SET archived = TRUE
                 WHERE id = %s
                 RETURNING id
             ''', (task_id,))
         
         result = cur.fetchone()
         conn.commit()
-        cur.close()
-        conn.close()
         
         logger.info(f"✅ Статус задачи {task_id} обновлен на {status}")
         return result is not None
     except Exception as e:
         logger.error(f"❌ Ошибка обновления статуса задачи: {e}")
-        try:
-            conn.close()
-        except:
-            pass
+        if conn:
+            conn.rollback()
         return False
+    finally:
+        if conn:
+            conn.close()
 
 def get_pending_notifications():
     """Получает задачи, для которых нужно отправить уведомления"""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
         
         # Ищем уведомления, у которых remind_at наступил (в UTC)
+        # Без условия на status, так как колонка может отсутствовать
         cur.execute('''
             SELECT id, user_id, text, date, time, emoji, remind_at, task_type, is_reminder
             FROM tasks 
@@ -292,41 +297,35 @@ def get_pending_notifications():
             AND deleted = FALSE
             AND completed = FALSE
             AND archived = FALSE
-            AND (status IS NULL OR status = 'active')
             AND (is_reminder = TRUE OR task_type = 'task')
             ORDER BY remind_at
         ''')
         
         tasks = cur.fetchall()
-        cur.close()
-        conn.close()
-        
         logger.info(f"🔔 Найдено уведомлений для отправки: {len(tasks)}")
         return tasks
     except Exception as e:
         logger.error(f"❌ Ошибка получения уведомлений: {e}")
-        try:
-            conn.close()
-        except:
-            pass
         return []
+    finally:
+        if conn:
+            conn.close()
 
 def archive_overdue_tasks():
     """Архивирует просроченные задачи"""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
 
         cur.execute('''
             UPDATE tasks 
-            SET archived = TRUE,
-                status = 'archived'
+            SET archived = TRUE
             WHERE date < CURRENT_DATE 
             AND completed = FALSE 
             AND deleted = FALSE 
             AND is_reminder = FALSE
             AND archived = FALSE
-            AND (status IS NULL OR status = 'active')
             RETURNING id
         ''')
         
@@ -334,21 +333,20 @@ def archive_overdue_tasks():
         archived_count = len(archived_tasks)
         
         conn.commit()
-        cur.close()
-        conn.close()
-        
         logger.info(f"📦 Заархивировано {archived_count} просроченных задач")
         return archived_count
     except Exception as e:
         logger.error(f"❌ Ошибка архивации просроченных задач: {e}")
-        try:
-            conn.close()
-        except:
-            pass
+        if conn:
+            conn.rollback()
         return 0
+    finally:
+        if conn:
+            conn.close()
 
 def cleanup_old_reminders():
     """Очищает старые отправленные напоминания (старше 7 дней)."""
+    conn = None
     try:
         conn = get_connection()
         cur = conn.cursor()
@@ -362,15 +360,13 @@ def cleanup_old_reminders():
         
         affected_rows = cur.rowcount
         conn.commit()
-        cur.close()
-        conn.close()
-        
         logger.info(f"🧹 Удалено {affected_rows} старых напоминаний")
         return affected_rows
     except Exception as e:
         logger.error(f"❌ Ошибка очистки старых напоминаний: {e}")
-        try:
-            conn.close()
-        except:
-            pass
+        if conn:
+            conn.rollback()
         return 0
+    finally:
+        if conn:
+            conn.close()
