@@ -59,9 +59,28 @@ def init_db():
             )
         ''')
 
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_remind_at ON tasks(remind_at)')
-        cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)')
+        # Создаем индексы (используем IF NOT EXISTS для PostgreSQL)
+        try:
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_user_id ON tasks(user_id)')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_remind_at ON tasks(remind_at)')
+            cur.execute('CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)')
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка создания индекса, возможно уже существует: {e}")
+            # Если индексы уже существуют, продолжаем
+        
+        # Проверяем и добавляем недостающие колонки
+        try:
+            # Проверяем наличие колонки status
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name='tasks' AND column_name='status'
+            """)
+            if not cur.fetchone():
+                cur.execute('ALTER TABLE tasks ADD COLUMN status TEXT DEFAULT \'active\'')
+                logger.info("✅ Добавлена колонка status")
+        except Exception as e:
+            logger.warning(f"⚠️ Ошибка проверки/добавления колонки status: {e}")
         
         conn.commit()
         cur.close()
@@ -70,7 +89,11 @@ def init_db():
         
     except Exception as e:
         logger.error(f"❌ Ошибка инициализации БД: {e}")
-        raise
+        # Не падаем полностью, возможно таблица уже создана
+        try:
+            conn.close()
+        except:
+            pass
 
 def add_task(user_id, text, date=None, time=None, reminder=0, 
              category='personal', priority='medium', emoji='📝',
@@ -112,6 +135,10 @@ def add_task(user_id, text, date=None, time=None, reminder=0,
         return task_id
     except Exception as e:
         logger.error(f"❌ Ошибка добавления задачи: {e}")
+        try:
+            conn.close()
+        except:
+            pass
         return None
 
 def get_tasks_by_user(user_id, include_archived=False):
@@ -143,7 +170,7 @@ def get_tasks_by_user(user_id, include_archived=False):
                 WHERE user_id = %s 
                 AND deleted = FALSE
                 AND archived = FALSE
-                AND status != 'archived'
+                AND (status IS NULL OR status != 'archived')
                 ORDER BY 
                     CASE WHEN date IS NULL THEN 1 ELSE 0 END,
                     date,
@@ -158,6 +185,10 @@ def get_tasks_by_user(user_id, include_archived=False):
         return tasks
     except Exception as e:
         logger.error(f"❌ Ошибка получения задач: {e}")
+        try:
+            conn.close()
+        except:
+            pass
         return []
 
 def update_task(task_id, user_id, updates):
@@ -191,6 +222,10 @@ def update_task(task_id, user_id, updates):
         return result is not None
     except Exception as e:
         logger.error(f"❌ Ошибка обновления задачи: {e}")
+        try:
+            conn.close()
+        except:
+            pass
         return False
 
 def update_task_status(task_id, status):
@@ -236,6 +271,10 @@ def update_task_status(task_id, status):
         return result is not None
     except Exception as e:
         logger.error(f"❌ Ошибка обновления статуса задачи: {e}")
+        try:
+            conn.close()
+        except:
+            pass
         return False
 
 def get_pending_notifications():
@@ -246,14 +285,14 @@ def get_pending_notifications():
         
         # Ищем уведомления, у которых remind_at наступил (в UTC)
         cur.execute('''
-            SELECT id, user_id, text, date, time, emoji, remind_at, task_type
+            SELECT id, user_id, text, date, time, emoji, remind_at, task_type, is_reminder
             FROM tasks 
             WHERE remind_at IS NOT NULL
             AND remind_at <= NOW() AT TIME ZONE 'UTC'
             AND deleted = FALSE
             AND completed = FALSE
             AND archived = FALSE
-            AND status = 'active'
+            AND (status IS NULL OR status = 'active')
             AND (is_reminder = TRUE OR task_type = 'task')
             ORDER BY remind_at
         ''')
@@ -266,6 +305,10 @@ def get_pending_notifications():
         return tasks
     except Exception as e:
         logger.error(f"❌ Ошибка получения уведомлений: {e}")
+        try:
+            conn.close()
+        except:
+            pass
         return []
 
 def archive_overdue_tasks():
@@ -283,7 +326,7 @@ def archive_overdue_tasks():
             AND deleted = FALSE 
             AND is_reminder = FALSE
             AND archived = FALSE
-            AND status = 'active'
+            AND (status IS NULL OR status = 'active')
             RETURNING id
         ''')
         
@@ -298,6 +341,10 @@ def archive_overdue_tasks():
         return archived_count
     except Exception as e:
         logger.error(f"❌ Ошибка архивации просроченных задач: {e}")
+        try:
+            conn.close()
+        except:
+            pass
         return 0
 
 def cleanup_old_reminders():
@@ -322,4 +369,8 @@ def cleanup_old_reminders():
         return affected_rows
     except Exception as e:
         logger.error(f"❌ Ошибка очистки старых напоминаний: {e}")
+        try:
+            conn.close()
+        except:
+            pass
         return 0
